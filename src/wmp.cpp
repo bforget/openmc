@@ -23,6 +23,76 @@ WindowedMultipole::WindowedMultipole(hid_t group)
   // Get name of nuclide from group, removing leading '/'
   name_ = object_name(group).substr(1);
 
+  // Global-pole format (AAA-fit libraries): detected by the presence of
+  // the external-pole dataset. See wmp.h for the format description.
+  if (object_exists(group, "ext_poles")) {
+    global_format_ = true;
+    read_dataset(group, "sqrtAWR", sqrt_awr_);
+    read_dataset(group, "E_min", E_min_);
+    read_dataset(group, "E_max", E_max_);
+
+    tensor::Tensor<std::complex<double>> poles;    // (n_pool,)
+    tensor::Tensor<std::complex<double>> residues; // (n_pool, 3): s, f, g
+    read_dataset(group, "poles", poles);
+    read_dataset(group, "residues", residues);
+    fissionable_ = true; // [MT2, MT18, MT102] layout
+    if (residues.shape(1) == 2)
+      fissionable_ = false; // [MT2, MT102]
+
+    int n_pool = poles.shape(0);
+    gdata_ = tensor::Tensor<std::complex<double>>({(size_t)n_pool, 4});
+    for (int i = 0; i < n_pool; ++i) {
+      gdata_(i, MP_EA) = poles[i];
+      if (fissionable_) {
+        gdata_(i, MP_RS) = residues(i, 0);              // MT2
+        gdata_(i, MP_RA) = residues(i, 1) + residues(i, 2); // MT18 + MT102
+        gdata_(i, MP_RF) = residues(i, 1);              // MT18
+      } else {
+        gdata_(i, MP_RS) = residues(i, 0);
+        gdata_(i, MP_RA) = residues(i, 1);
+        gdata_(i, MP_RF) = 0.0;
+      }
+    }
+
+    tensor::Tensor<int64_t> wstart, wend;
+    read_dataset(group, "win_pole_start", wstart);
+    read_dataset(group, "win_pole_end", wend);
+    int n_win = wstart.shape(0);
+    win_start_.resize(n_win);
+    win_end_.resize(n_win);
+    for (int i = 0; i < n_win; ++i) {
+      win_start_[i] = wstart[i];
+      win_end_[i] = wend[i];
+    }
+
+    tensor::Tensor<double> bounds;
+    read_dataset(group, "sqrtE_bounds", bounds);
+    sqrtE_bounds_.assign(bounds.begin(), bounds.end());
+
+    tensor::Tensor<std::complex<double>> xp;  // (n_win, 4)
+    tensor::Tensor<std::complex<double>> xr;  // (n_win, 4, 3)
+    read_dataset(group, "ext_poles", xp);
+    read_dataset(group, "ext_residues", xr);
+    int n_ext = xp.shape(1);
+    ext_data_ =
+      tensor::Tensor<std::complex<double>>({(size_t)n_win, (size_t)n_ext, 4});
+    for (int i = 0; i < n_win; ++i) {
+      for (int j = 0; j < n_ext; ++j) {
+        ext_data_(i, j, MP_EA) = xp(i, j);
+        if (fissionable_) {
+          ext_data_(i, j, MP_RS) = xr(i, j, 0);
+          ext_data_(i, j, MP_RA) = xr(i, j, 1) + xr(i, j, 2);
+          ext_data_(i, j, MP_RF) = xr(i, j, 1);
+        } else {
+          ext_data_(i, j, MP_RS) = xr(i, j, 0);
+          ext_data_(i, j, MP_RA) = xr(i, j, 1);
+          ext_data_(i, j, MP_RF) = 0.0;
+        }
+      }
+    }
+    return;
+  }
+
   // Read scalar values.
   read_dataset(group, "spacing", inv_spacing_);
   inv_spacing_ = 1.0 / inv_spacing_;
@@ -90,6 +160,64 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
   // Define some frequently used variables.
   double sqrtE = std::sqrt(E);
   double invE = 1.0 / E;
+
+  // ==========================================================================
+  // Global-pole format (see wmp.h): variable-width windows, pool pointer
+  // range + external poles, sigma-basis analytic broadening.
+
+  if (global_format_) {
+    // Variable-width windows: binary search on sqrt(E) boundaries
+    int i_window =
+      std::upper_bound(sqrtE_bounds_.begin(), sqrtE_bounds_.end(), sqrtE) -
+      sqrtE_bounds_.begin() - 1;
+    i_window = std::min(std::max(i_window, 0), (int)win_start_.size() - 1);
+
+    double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
+    int n_ext = ext_data_.shape(1);
+
+    auto accumulate = [&](const std::complex<double>& p,
+                        const std::complex<double>& rs,
+                        const std::complex<double>& ra,
+                        const std::complex<double>& rf, double xi) {
+      std::complex<double> base;
+      if (xi <= 0.0 || p.real() == 0.0) {
+        // 0K pole sum; the 1/v pole (Re p = 0) is exactly invariant under
+        // free-gas broadening and is always evaluated unbroadened.
+        base = 1.0 / (sqrtE - p);
+      } else {
+        std::complex<double> z = (p - sqrtE) / xi;
+        if (std::abs(z.real()) > 1.0e2 || std::abs(z.imag()) > 1.0e2) {
+          // |z| >> 1: broadening changes the tail by O(1/|z|^2) < 1e-4,
+          // while the Faddeeva form suffers catastrophic cancellation
+          // ((u+p) vs p^2*w terms) amplified by (|p|/u)^2 -- very broad
+          // background poles evaluated at very low E. Use the 0K form.
+          base = 1.0 / (sqrtE - p);
+        } else {
+          // (1/E) Re[r ((u+p) + p^2 (i sqrt(pi)/xi) w((p-u)/xi))]
+          std::complex<double> w_val = faddeeva(z);
+          base = ((sqrtE + p) +
+                   p * p * (std::complex<double>(0.0, SQRT_PI) / xi) * w_val) *
+                 invE;
+        }
+      }
+      sig_s += (rs * base).real();
+      sig_a += (ra * base).real();
+      if (fissionable_)
+        sig_f += (rf * base).real();
+    };
+
+    // xi = sqrt(kT/AWR) in sqrt(eV); sqrtkT = sqrt(kT)
+    double xi = (sqrtkT > 0.0) ? sqrtkT / sqrt_awr_ : 0.0;
+    for (int i = win_start_[i_window]; i < win_end_[i_window]; ++i) {
+      accumulate(
+        gdata_(i, MP_EA), gdata_(i, MP_RS), gdata_(i, MP_RA), gdata_(i, MP_RF), xi);
+    }
+    for (int j = 0; j < n_ext; ++j) {
+      accumulate(ext_data_(i_window, j, MP_EA), ext_data_(i_window, j, MP_RS),
+        ext_data_(i_window, j, MP_RA), ext_data_(i_window, j, MP_RF), xi);
+    }
+    return std::make_tuple(sig_s, sig_a, sig_f);
+  }
 
   // Locate window containing energy
   int i_window = std::min(window_info_.size() - 1,
@@ -180,6 +308,11 @@ std::tuple<double, double, double> WindowedMultipole::evaluate_deriv(
   if (sqrtkT == 0.0) {
     fatal_error("Windowed multipole temperature derivatives are not implemented"
                 " for 0 Kelvin cross sections.");
+  }
+
+  if (global_format_) {
+    fatal_error("Windowed multipole temperature derivatives are not "
+                "implemented for global-pole format libraries.");
   }
 
   // Locate us

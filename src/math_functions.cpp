@@ -892,6 +892,35 @@ double spline_integrate(int n, const double x[], const double y[],
   return s;
 }
 
+std::complex<double> zpf8h(std::complex<double> z)
+{
+  // 8th-order shifted rational approximation of the Faddeeva function
+  // (Forget et al., PHYSOR; implementation after J. Yu,
+  // github.com/jiankai-yu/openmc-wmp-zp8h). Branch-free: one Horner
+  // chain + a z^2 denominator. Accuracy ~1e-5 in the WMP argument
+  // domain -- far beyond cross-section needs, at a fraction of the
+  // MIT Faddeeva cost and with uniform, temperature-independent timing.
+  using C = std::complex<double>;
+  z += C(0.0, 0.9);
+  const auto zz = z * z;
+  constexpr std::array<C, 8> aa8 = {C(+11.7559071436993, 0.0),
+    C(0.0, -32.310199761603), C(-21.9357456686406, 0.0),
+    C(0.0, 31.490536152863), C(6.75847413957232, 0.0),
+    C(0.0, -8.07354660639634), C(-0.507771291744591, 0.0),
+    C(0.0, 0.564189504758109)};
+  constexpr std::array<double, 5> bb8 = {6.5625, -52.5, 52.5, -14.0, 1.0};
+  return (((((((aa8[7] * z + aa8[6]) * z + aa8[5]) * z + aa8[4]) * z +
+              aa8[3]) *
+               z +
+             aa8[2]) *
+              z +
+            aa8[1]) *
+             z +
+           aa8[0]) /
+         ((((bb8[4] * zz + bb8[3]) * zz + bb8[2]) * zz + bb8[1]) * zz +
+           bb8[0]);
+}
+
 std::complex<double> faddeeva(std::complex<double> z)
 {
   // Technically, the value we want is given by the equation:
@@ -908,8 +937,12 @@ std::complex<double> faddeeva(std::complex<double> z)
   // For imag(z) < 0, w_int(z) = -conjg(w_fun(conjg(z)))
 
   // Note that Faddeeva::w will interpret zero as machine epsilon
-  return z.imag() > 0.0 ? Faddeeva::w(z)
-                        : -std::conj(Faddeeva::w(std::conj(z)));
+  // Kernel selection: zpf8h (branch-free 8th-order rational) for WMP
+  // speed; switch back to Faddeeva::w for full precision if needed.
+#define OPENMC_W_IMPL zpf8h
+  return z.imag() > 0.0 ? OPENMC_W_IMPL(z)
+                        : -std::conj(OPENMC_W_IMPL(std::conj(z)));
+#undef OPENMC_W_IMPL
 }
 
 std::complex<double> w_derivative(std::complex<double> z, int order)

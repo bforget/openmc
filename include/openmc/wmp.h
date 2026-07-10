@@ -82,6 +82,25 @@ public:
     curvefit_; // Curve fit coefficients (window, poly order, reaction)
   tensor::Tensor<std::complex<double>> data_; //!< Poles and residues
 
+  // Global-pole format (AAA-fit libraries, 2026): global pole/residue
+  // table + contiguous per-window pointer ranges + 4 external poles per
+  // window replacing the polynomial curvefit. sigma_mt(E) =
+  // sum Re[r/(sqrt(E)-p)] over the owning window's range + externals;
+  // at temperature each pole broadens analytically as
+  // (1/E) Re[r ((u+p) + p^2 (i sqrt(pi)/xi) w((p-u)/xi))], with the 1/v
+  // pole (Re p = 0) evaluated unbroadened (exactly invariant).
+  // TEST-PHASE LIMITATIONS: resolved segment only; low-E image-kernel
+  // correction (E < ~(4.5 xi)^2, sub-5-meV) not implemented;
+  // evaluate_deriv not implemented.
+  bool global_format_ {false};   //!< New-format library?
+  vector<double> sqrtE_bounds_;  //!< Window boundaries in sqrt(E) [n_win+1]
+  vector<int> win_start_;        //!< First pool-pole index per window
+  vector<int> win_end_;          //!< One-past-last pool-pole index
+  // Pool: [pole, r_elastic, r_absorption, r_fission] like data_ columns
+  tensor::Tensor<std::complex<double>> gdata_; //!< (n_pool, 4)
+  // Externals: 4 per window, same column convention
+  tensor::Tensor<std::complex<double>> ext_data_; //!< (n_win, 4, 4)
+
   // Constant data
   static constexpr int MAX_POLY_COEFFICIENTS =
     11; //!< Max order of polynomial fit plus one
