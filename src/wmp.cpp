@@ -69,6 +69,22 @@ WindowedMultipole::WindowedMultipole(hid_t group)
     read_dataset(group, "sqrtE_bounds", bounds);
     sqrtE_bounds_.assign(bounds.begin(), bounds.end());
 
+    // Build the two-level O(1) window index (see wmp.h)
+    {
+      int n_cells = 4 * n_win;
+      double u_lo = sqrtE_bounds_.front();
+      double u_hi = sqrtE_bounds_.back();
+      cell_inv_du_ = n_cells / (u_hi - u_lo);
+      cell_first_.resize(n_cells);
+      int w = 0;
+      for (int i = 0; i < n_cells; ++i) {
+        double u_cell = u_lo + i / cell_inv_du_;
+        while (w < n_win - 1 && sqrtE_bounds_[w + 1] <= u_cell)
+          ++w;
+        cell_first_[i] = w;
+      }
+    }
+
     tensor::Tensor<std::complex<double>> xp;  // (n_win, 4)
     tensor::Tensor<std::complex<double>> xr;  // (n_win, 4, 3)
     read_dataset(group, "ext_poles", xp);
@@ -166,11 +182,14 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
   // range + external poles, sigma-basis analytic broadening.
 
   if (global_format_) {
-    // Variable-width windows: binary search on sqrt(E) boundaries
-    int i_window =
-      std::upper_bound(sqrtE_bounds_.begin(), sqrtE_bounds_.end(), sqrtE) -
-      sqrtE_bounds_.begin() - 1;
-    i_window = std::min(std::max(i_window, 0), (int)win_start_.size() - 1);
+    // Variable-width windows: O(1) two-level index (uniform coarse grid in
+    // sqrt(E) + short forward walk; see wmp.h)
+    int n_win = win_start_.size();
+    int cell = (int)((sqrtE - sqrtE_bounds_[0]) * cell_inv_du_);
+    cell = std::min(std::max(cell, 0), (int)cell_first_.size() - 1);
+    int i_window = cell_first_[cell];
+    while (i_window < n_win - 1 && sqrtE >= sqrtE_bounds_[i_window + 1])
+      ++i_window;
 
     double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
     int n_ext = ext_data_.shape(1);

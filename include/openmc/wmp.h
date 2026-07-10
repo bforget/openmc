@@ -96,6 +96,12 @@ public:
   vector<double> sqrtE_bounds_;  //!< Window boundaries in sqrt(E) [n_win+1]
   vector<int> win_start_;        //!< First pool-pole index per window
   vector<int> win_end_;          //!< One-past-last pool-pole index
+  // Two-level O(1) window lookup over the variable-width windows: a uniform
+  // coarse grid in sqrt(E) (4 cells per window on average) stores the first
+  // window overlapping each cell; a lookup is one multiply + a short forward
+  // walk (bounded by windows-per-cell, ~1). Replaces the binary search.
+  vector<int> cell_first_;       //!< First window overlapping each grid cell
+  double cell_inv_du_ {0.0};     //!< 1 / coarse-cell width in sqrt(E)
   // Pool: [pole, r_elastic, r_absorption, r_fission] like data_ columns
   tensor::Tensor<std::complex<double>> gdata_; //!< (n_pool, 4)
   // Externals: 4 per window, same column convention
