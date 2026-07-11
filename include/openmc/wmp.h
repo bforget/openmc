@@ -47,6 +47,13 @@ public:
   // Constructors, destructors
   WindowedMultipole(hid_t group);
 
+  //! Read a global-pole-format segment (poles/residues/windows/externals)
+  //! into the resolved-segment members.
+  void read_global_segment(hid_t group);
+
+  //! Read the fast segment and build the collapsed transport residues.
+  void read_fast_segment(hid_t group);
+
   // Methods
 
   //! \brief Evaluate the windowed multipole equations for cross sections in the
@@ -68,6 +75,17 @@ public:
   //!         fission cross sections in [b/K]
   std::tuple<double, double, double> evaluate_deriv(
     double E, double sqrtkT) const;
+
+  //! \brief Evaluate the fast-segment (URR+fast) pole representation.
+  //!
+  //! T=0 pole sum over all fitted channels, collapsed at load time to the
+  //! four transport quantities; threshold clamps honored (channels that
+  //! turn on/off inside a window are evaluated individually and gated).
+  //!
+  //! \param E Incident neutron energy in [eV], seam < E <= fast_E_max_
+  //! \return Tuple of total, elastic scattering, absorption (fission +
+  //!         disappearance), and fission cross sections in [b]
+  std::tuple<double, double, double, double> evaluate_fast(double E) const;
 
   // Data members
   std::string name_;               //!< Name of nuclide
@@ -102,6 +120,35 @@ public:
   // walk (bounded by windows-per-cell, ~1). Replaces the binary search.
   vector<int> cell_first_;       //!< First window overlapping each grid cell
   double cell_inv_du_ {0.0};     //!< 1 / coarse-cell width in sqrt(E)
+
+  // Fast segment (URR + fast range, seam..fast_E_max_, T=0 pole sum).
+  // The HDF5 stores per-channel residues (n_pool x n_mts) + 4 external
+  // poles/window + per-channel threshold clamps [mt_E_on, mt_E_off].
+  // At load, each window's pointer range AND its 4 externals are flattened
+  // into one pole array with residues COLLAPSED to the four transport
+  // quantities (elastic / fission / disappearance / other-scattering) over
+  // the channels fully active across that window. Channels that turn on or
+  // off strictly inside a window (boundary-merge tolerance) are kept as
+  // per-window "partials" and evaluated individually behind their clamp.
+  bool fast_present_ {false};
+  double fast_E_max_ {0.0};       //!< Upper energy of fast segment [eV]
+  vector<double> fast_bounds_;    //!< Window bounds in sqrt(E) [n_fwin+1]
+  vector<int> fast_cell_first_;   //!< O(1) index over fast windows
+  double fast_cell_inv_du_ {0.0};
+  vector<int> fw_off_;            //!< Flattened pole offsets [n_fwin+1]
+  vector<std::complex<double>> fw_pole_;  //!< Poles incl. externals
+  vector<std::complex<double>> fw_r_el_;  //!< Collapsed elastic residues
+  vector<std::complex<double>> fw_r_fis_; //!< Collapsed fission residues
+  vector<std::complex<double>> fw_r_dis_; //!< Collapsed disappearance res.
+  vector<std::complex<double>> fw_r_oth_; //!< Collapsed other-scatter res.
+  struct FastPartial {
+    double E_on;  //!< Clamp: zero below this energy [eV]
+    double E_off; //!< Clamp: zero above this energy [eV]
+    int kind;     //!< 0 other-scatter, 1 fission, 2 disappearance, 3 elastic
+    int res_off;  //!< Offset into fp_res_ (window pole count entries)
+  };
+  vector<vector<FastPartial>> fast_partials_; //!< Per-window partial channels
+  vector<std::complex<double>> fp_res_;       //!< Partial-channel residues
   // Pool: [pole, r_elastic, r_absorption, r_fission] like data_ columns
   tensor::Tensor<std::complex<double>> gdata_; //!< (n_pool, 4)
   // Externals: 4 per window, same column convention

@@ -805,6 +805,26 @@ void Nuclide::calculate_xs(
         }
       }
     }
+
+    // Fast-segment multipole: override the transport cross sections with
+    // the T=0 pole sums. The grid indices/interp factor set above stay
+    // valid — channel-within-scattering sampling, partial fissions, and
+    // secondary distributions keep using the tabulated data (by design:
+    // poles carry the transport xs, ACE carries branching + secondaries).
+    // NOTE: URR ptables are not wired to the pole base yet — run with
+    // settings.ptables = False when using fast-segment WMP libraries.
+    if (multipole_ && multipole_->fast_present_ &&
+        p.E() > multipole_->E_max_ && p.E() <= multipole_->fast_E_max_) {
+      double sig_t, sig_s, sig_a, sig_f;
+      std::tie(sig_t, sig_s, sig_a, sig_f) =
+        multipole_->evaluate_fast(p.E());
+      micro.total = sig_t;
+      micro.elastic = sig_s;
+      micro.absorption = sig_a;
+      micro.fission = sig_f;
+      micro.nu_fission =
+        fissionable_ ? sig_f * this->nu(p.E(), EmissionMode::total) : 0.0;
+    }
   }
 
   // Initialize sab treatment to false

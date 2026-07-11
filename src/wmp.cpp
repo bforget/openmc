@@ -23,9 +23,81 @@ WindowedMultipole::WindowedMultipole(hid_t group)
   // Get name of nuclide from group, removing leading '/'
   name_ = object_name(group).substr(1);
 
+  // Two-segment global-pole format: /resolved (analytic Doppler) +
+  // /fast (T=0 pole sum with per-channel residues and threshold clamps).
+  if (object_exists(group, "resolved")) {
+    read_global_segment(open_group(group, "resolved"));
+    if (object_exists(group, "fast")) {
+      read_fast_segment(open_group(group, "fast"));
+    }
+    return;
+  }
+
   // Global-pole format (AAA-fit libraries): detected by the presence of
   // the external-pole dataset. See wmp.h for the format description.
   if (object_exists(group, "ext_poles")) {
+    read_global_segment(group);
+    return;
+  }
+
+  // Read scalar values.
+  read_dataset(group, "spacing", inv_spacing_);
+  inv_spacing_ = 1.0 / inv_spacing_;
+  read_dataset(group, "sqrtAWR", sqrt_awr_);
+  read_dataset(group, "E_min", E_min_);
+  read_dataset(group, "E_max", E_max_);
+
+  // Read the "data" array.  Use its shape to figure out the number of poles
+  // and residue types in this data.
+  read_dataset(group, "data", data_);
+  int n_residues = data_.shape(1) - 1;
+
+  // Check to see if this data includes fission residues.
+  fissionable_ = (n_residues == 3);
+
+  // Read the "windows" array and use its shape to figure out the number of
+  // windows.
+  tensor::Tensor<int> windows;
+  read_dataset(group, "windows", windows);
+  int n_windows = windows.shape(0);
+  windows -= 1; // Adjust to 0-based indices
+
+  // Read the "broaden_poly" arrays.
+  tensor::Tensor<bool> broaden_poly;
+  read_dataset(group, "broaden_poly", broaden_poly);
+  if (n_windows != broaden_poly.shape(0)) {
+    fatal_error("broaden_poly array shape is not consistent with the windows "
+                "array shape in WMP library for " +
+                name_ + ".");
+  }
+
+  // Read the "curvefit" array.
+  read_dataset(group, "curvefit", curvefit_);
+  if (n_windows != curvefit_.shape(0)) {
+    fatal_error("curvefit array shape is not consistent with the windows "
+                "array shape in WMP library for " +
+                name_ + ".");
+  }
+  fit_order_ = curvefit_.shape(1) - 1;
+
+  // Check the code is compiling to work with sufficiently high fit order
+  if (fit_order_ + 1 > MAX_POLY_COEFFICIENTS) {
+    fatal_error(fmt::format(
+      "Need to compile with WindowedMultipole::MAX_POLY_COEFFICIENTS = {}",
+      fit_order_ + 1));
+  }
+
+  // Move window information into a vector
+  window_info_.resize(n_windows);
+  for (int i = 0; i < n_windows; ++i) {
+    window_info_[i].index_start = windows(i, 0);
+    window_info_[i].index_end = windows(i, 1);
+    window_info_[i].broaden_poly = broaden_poly[i];
+  }
+}
+
+void WindowedMultipole::read_global_segment(hid_t group)
+{
     global_format_ = true;
     read_dataset(group, "sqrtAWR", sqrt_awr_);
     read_dataset(group, "E_min", E_min_);
@@ -106,63 +178,190 @@ WindowedMultipole::WindowedMultipole(hid_t group)
         }
       }
     }
-    return;
+}
+
+void WindowedMultipole::read_fast_segment(hid_t group)
+{
+  fast_present_ = true;
+  read_dataset(group, "E_max", fast_E_max_);
+
+  tensor::Tensor<std::complex<double>> poles;    // (n_pool,)
+  tensor::Tensor<std::complex<double>> residues; // (n_pool, n_mts)
+  tensor::Tensor<int64_t> mts, wstart, wend;
+  tensor::Tensor<double> e_on, e_off, bounds;
+  tensor::Tensor<std::complex<double>> xp; // (n_win, n_ext)
+  tensor::Tensor<std::complex<double>> xr; // (n_win, n_ext, n_mts)
+  read_dataset(group, "poles", poles);
+  read_dataset(group, "residues", residues);
+  read_dataset(group, "mts", mts);
+  read_dataset(group, "mt_E_on", e_on);
+  read_dataset(group, "mt_E_off", e_off);
+  read_dataset(group, "win_pole_start", wstart);
+  read_dataset(group, "win_pole_end", wend);
+  read_dataset(group, "sqrtE_bounds", bounds);
+  read_dataset(group, "ext_poles", xp);
+  read_dataset(group, "ext_residues", xr);
+
+  int n_win = wstart.shape(0);
+  int n_mts = mts.shape(0);
+  int n_ext = xp.shape(1);
+  fast_bounds_.assign(bounds.begin(), bounds.end());
+
+  // Transport kind of each channel: 0 other-scatter (inelastic, (n,xn),
+  // MT5, ...), 1 fission, 2 disappearance lump, 3 elastic.
+  vector<int> kind(n_mts, 0);
+  for (int c = 0; c < n_mts; ++c) {
+    int mt = mts[c];
+    if (mt == 2) {
+      kind[c] = 3;
+    } else if (mt == 18) {
+      kind[c] = 1;
+    } else if (mt == 101 || mt == 102 || mt == 103 || mt == 107) {
+      kind[c] = 2;
+    }
   }
 
-  // Read scalar values.
-  read_dataset(group, "spacing", inv_spacing_);
-  inv_spacing_ = 1.0 / inv_spacing_;
-  read_dataset(group, "sqrtAWR", sqrt_awr_);
-  read_dataset(group, "E_min", E_min_);
-  read_dataset(group, "E_max", E_max_);
+  // Flatten each window's pointer range + externals; collapse residues of
+  // fully-active channels into the four transport vectors, keep channels
+  // that turn on/off inside the window as individually-clamped partials.
+  fw_off_.assign(n_win + 1, 0);
+  fast_partials_.resize(n_win);
+  for (int w = 0; w < n_win; ++w) {
+    int np = (wend[w] - wstart[w]) + n_ext;
+    if (np > 96) {
+      fatal_error(fmt::format("Fast WMP window with {} active poles exceeds "
+                              "the evaluator's stack buffer (96) for {}.",
+        np, name_));
+    }
+    fw_off_[w + 1] = fw_off_[w] + np;
+  }
+  int n_flat = fw_off_[n_win];
+  fw_pole_.assign(n_flat, 0.0);
+  fw_r_el_.assign(n_flat, 0.0);
+  fw_r_fis_.assign(n_flat, 0.0);
+  fw_r_dis_.assign(n_flat, 0.0);
+  fw_r_oth_.assign(n_flat, 0.0);
 
-  // Read the "data" array.  Use its shape to figure out the number of poles
-  // and residue types in this data.
-  read_dataset(group, "data", data_);
-  int n_residues = data_.shape(1) - 1;
+  for (int w = 0; w < n_win; ++w) {
+    double e_lo = fast_bounds_[w] * fast_bounds_[w];
+    double e_hi = fast_bounds_[w + 1] * fast_bounds_[w + 1];
+    int np = wend[w] - wstart[w];
+    int base = fw_off_[w];
+    for (int k = 0; k < np; ++k)
+      fw_pole_[base + k] = poles[wstart[w] + k];
+    for (int j = 0; j < n_ext; ++j)
+      fw_pole_[base + np + j] = xp(w, j);
 
-  // Check to see if this data includes fission residues.
-  fissionable_ = (n_residues == 3);
-
-  // Read the "windows" array and use its shape to figure out the number of
-  // windows.
-  tensor::Tensor<int> windows;
-  read_dataset(group, "windows", windows);
-  int n_windows = windows.shape(0);
-  windows -= 1; // Adjust to 0-based indices
-
-  // Read the "broaden_poly" arrays.
-  tensor::Tensor<bool> broaden_poly;
-  read_dataset(group, "broaden_poly", broaden_poly);
-  if (n_windows != broaden_poly.shape(0)) {
-    fatal_error("broaden_poly array shape is not consistent with the windows "
-                "array shape in WMP library for " +
-                name_ + ".");
+    for (int c = 0; c < n_mts; ++c) {
+      // Overlap of the channel's active range with this window
+      if (e_on[c] >= e_hi || e_off[c] <= e_lo)
+        continue; // channel inactive across the whole window
+      // Exact comparison: a channel whose clamp lies even 1 ulp inside the
+      // window is kept as a partial (clamped pointwise) — collapsing it
+      // would leak the fit's unconstrained below-threshold value into the
+      // sliver between the window edge and the clamp.
+      bool full = (e_on[c] <= e_lo) && (e_off[c] >= e_hi);
+      if (full) {
+        auto& acc = (kind[c] == 3)   ? fw_r_el_
+                    : (kind[c] == 1) ? fw_r_fis_
+                    : (kind[c] == 2) ? fw_r_dis_
+                                     : fw_r_oth_;
+        for (int k = 0; k < np; ++k)
+          acc[base + k] += residues(wstart[w] + k, c);
+        for (int j = 0; j < n_ext; ++j)
+          acc[base + np + j] += xr(w, j, c);
+      } else {
+        // Partially active: keep separate, clamp at evaluation time
+        FastPartial part;
+        part.E_on = e_on[c];
+        part.E_off = e_off[c];
+        part.kind = kind[c];
+        part.res_off = (int)fp_res_.size();
+        for (int k = 0; k < np; ++k)
+          fp_res_.push_back(residues(wstart[w] + k, c));
+        for (int j = 0; j < n_ext; ++j)
+          fp_res_.push_back(xr(w, j, c));
+        fast_partials_[w].push_back(part);
+      }
+    }
   }
 
-  // Read the "curvefit" array.
-  read_dataset(group, "curvefit", curvefit_);
-  if (n_windows != curvefit_.shape(0)) {
-    fatal_error("curvefit array shape is not consistent with the windows "
-                "array shape in WMP library for " +
-                name_ + ".");
+  // O(1) two-level index over the fast windows
+  {
+    int n_cells = 4 * n_win;
+    double u_lo = fast_bounds_.front();
+    double u_hi = fast_bounds_.back();
+    fast_cell_inv_du_ = n_cells / (u_hi - u_lo);
+    fast_cell_first_.resize(n_cells);
+    int w = 0;
+    for (int i = 0; i < n_cells; ++i) {
+      double u_cell = u_lo + i / fast_cell_inv_du_;
+      while (w < n_win - 1 && fast_bounds_[w + 1] <= u_cell)
+        ++w;
+      fast_cell_first_[i] = w;
+    }
   }
-  fit_order_ = curvefit_.shape(1) - 1;
+}
 
-  // Check the code is compiling to work with sufficiently high fit order
-  if (fit_order_ + 1 > MAX_POLY_COEFFICIENTS) {
-    fatal_error(fmt::format(
-      "Need to compile with WindowedMultipole::MAX_POLY_COEFFICIENTS = {}",
-      fit_order_ + 1));
+std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
+  double E) const
+{
+  double sqrtE = std::sqrt(E);
+
+  // O(1) window lookup over the fast bounds
+  int n_win = fw_off_.size() - 1;
+  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
+  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
+  int w = fast_cell_first_[cell];
+  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
+    ++w;
+
+  int k0 = fw_off_[w];
+  int k1 = fw_off_[w + 1];
+  int np = k1 - k0;
+
+  // One reciprocal per pole; accumulate the four collapsed transport sums
+  constexpr int FAST_MAX_ACTIVE = 96;
+  std::complex<double> phi[FAST_MAX_ACTIVE];
+  double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
+  for (int k = 0; k < np; ++k) {
+    phi[k] = 1.0 / (sqrtE - fw_pole_[k0 + k]);
+    el += (fw_r_el_[k0 + k] * phi[k]).real();
+    fis += (fw_r_fis_[k0 + k] * phi[k]).real();
+    dis += (fw_r_dis_[k0 + k] * phi[k]).real();
+    oth += (fw_r_oth_[k0 + k] * phi[k]).real();
   }
 
-  // Move window information into a vector
-  window_info_.resize(n_windows);
-  for (int i = 0; i < n_windows; ++i) {
-    window_info_[i].index_start = windows(i, 0);
-    window_info_[i].index_end = windows(i, 1);
-    window_info_[i].broaden_poly = broaden_poly[i];
+  // Partially-clamped channels (rare; only near their thresholds)
+  for (const auto& part : fast_partials_[w]) {
+    if (E < part.E_on || E > part.E_off)
+      continue;
+    double s = 0.0;
+    for (int k = 0; k < np; ++k)
+      s += (fp_res_[part.res_off + k] * phi[k]).real();
+    switch (part.kind) {
+    case 3:
+      el += s;
+      break;
+    case 1:
+      fis += s;
+      break;
+    case 2:
+      dis += s;
+      break;
+    default:
+      oth += s;
+    }
   }
+
+  // Clip tiny negative excursions from the fit (thresholds, near-zero xs)
+  el = std::max(el, 0.0);
+  fis = std::max(fis, 0.0);
+  dis = std::max(dis, 0.0);
+  oth = std::max(oth, 0.0);
+
+  double total = el + fis + dis + oth;
+  return {total, el, dis + fis, fis};
 }
 
 std::tuple<double, double, double> WindowedMultipole::evaluate(
