@@ -411,60 +411,75 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     // Loop-invariant i*sqrt(pi)/xi
     std::complex<double> cxi(0.0, SQRT_PI * inv_xi);
 
-    auto accumulate = [&](const std::complex<double>& p,
-                        const std::complex<double>& rs,
-                        const std::complex<double>& ra,
-                        const std::complex<double>& rf, double xi) {
-      std::complex<double> base;
-      if (xi <= 0.0 || p.real() == 0.0) {
-        // 0K pole sum; the 1/v pole (Re p = 0) is exactly invariant under
-        // free-gas broadening and is always evaluated unbroadened.
-        base = 1.0 / (sqrtE - p);
+    // Hand-rolled complex arithmetic throughout (like the fast-segment
+    // loop): std::complex division and multiplication route through
+    // guarded libcalls / NaN-check branches; poles never coincide with
+    // real sqrtE so the naive forms are safe. Records [p, rs, ra, rf]
+    // are contiguous rows of gdata_ / ext_data_ walked by raw pointer.
+    double xi2 = xi * xi;
+    auto accumulate = [&](const std::complex<double>* rec) {
+      double pr = rec[0].real();
+      double pi = rec[0].imag();
+      // d = u - p
+      double dr = sqrtE - pr;
+      double di = -pi;
+      double br, bi; // base
+      // Broadening decision: 1/v pole (pr == 0) and T=0 are exact 0K;
+      // |z| >= 5 takes the stable asymptotic form (which includes the
+      // old |z| > 100 territory as its far tail); |z| < 5 pays zpf8h.
+      double m2 = dr * dr + di * di;
+      if (xi <= 0.0 || pr == 0.0) {
+        double minv = 1.0 / m2;
+        br = dr * minv;
+        bi = -di * minv;
+      } else if (m2 >= 25.0 * xi2) {
+        // Moderate-to-large |z|: base = [1 + (p/u)^2 c]/(u-p),
+        // c = t (1/2 + t (3/4 + 15 t/8)), t = xi^2/(u-p)^2 = 1/z^2.
+        // Substituting the Laurent series of w(z) ANALYTICALLY cancels
+        // the huge (u+p) vs p^2 w terms (naive substitution amplifies
+        // the truncation by the ~1e6 cancellation ratio). c -> 0
+        // recovers the 0K form; truncation <= ~3e-5 of c.
+        double minv = 1.0 / m2;
+        double ir = dr * minv; // inv_d
+        double ii = -di * minv;
+        // t = xi^2 * inv_d^2
+        double tr = xi2 * (ir * ir - ii * ii);
+        double ti = xi2 * (2.0 * ir * ii);
+        // c = t*(0.5 + t*(0.75 + t*1.875))
+        double cr = 0.75 + 1.875 * tr;
+        double ci = 1.875 * ti;
+        double hr = 0.5 + (tr * cr - ti * ci);
+        double hi = tr * ci + ti * cr;
+        cr = tr * hr - ti * hi;
+        ci = tr * hi + ti * hr;
+        // q = p^2 * invE
+        double p2r = (pr * pr - pi * pi) * invE;
+        double p2i = (2.0 * pr * pi) * invE;
+        // base = (1 + q*c) * inv_d
+        double gr = 1.0 + (p2r * cr - p2i * ci);
+        double gi = p2r * ci + p2i * cr;
+        br = gr * ir - gi * ii;
+        bi = gr * ii + gi * ir;
       } else {
-        std::complex<double> z = (p - sqrtE) * inv_xi;
-        if (std::abs(z.real()) > 1.0e2 || std::abs(z.imag()) > 1.0e2) {
-          // |z| >> 1: broadening changes the tail by O(1/|z|^2) < 1e-4,
-          // while the Faddeeva form suffers catastrophic cancellation
-          // ((u+p) vs p^2*w terms) amplified by (|p|/u)^2 -- very broad
-          // background poles evaluated at very low E. Use the 0K form.
-          base = 1.0 / (sqrtE - p);
-        } else {
-          double z2 = z.real() * z.real() + z.imag() * z.imag();
-          if (z2 >= 25.0) {
-            // Moderate |z| (5..100): substituting the 3-term Laurent
-            // series of w(z) into the base ANALYTICALLY cancels the huge
-            // (u+p) vs p^2*w terms (naive substitution amplifies the
-            // series truncation by the ~1e6 cancellation ratio):
-            //   base = [1 + (p/u)^2 c] / (u - p),
-            //   c = t (1/2 + t (3/4 + 15 t / 8)),  t = xi^2/(u-p)^2 = 1/z^2
-            // c -> 0 recovers the 0K form; truncation <= ~3e-5 of c.
-            std::complex<double> d = sqrtE - p;
-            double m2 = d.real() * d.real() + d.imag() * d.imag();
-            double minv = 1.0 / m2;
-            std::complex<double> inv_d(d.real() * minv, -d.imag() * minv);
-            std::complex<double> t = (xi * inv_d) * (xi * inv_d);
-            std::complex<double> c =
-              t * (0.5 + t * (0.75 + t * 1.875));
-            base = (1.0 + p * p * invE * c) * inv_d;
-          } else {
-            // (1/E) Re[r ((u+p) + p^2 (i sqrt(pi)/xi) w((p-u)/xi))]
-            std::complex<double> w_val = faddeeva(z);
-            base = ((sqrtE + p) + p * p * cxi * w_val) * invE;
-          }
-        }
+        // Near pole: full Faddeeva evaluation
+        std::complex<double> z(-dr * inv_xi, pi * inv_xi);
+        std::complex<double> w_val = faddeeva(z);
+        std::complex<double> p = rec[0];
+        std::complex<double> b =
+          ((sqrtE + p) + p * p * cxi * w_val) * invE;
+        br = b.real();
+        bi = b.imag();
       }
-      sig_s += (rs * base).real();
-      sig_a += (ra * base).real();
+      sig_s += rec[1].real() * br - rec[1].imag() * bi;
+      sig_a += rec[2].real() * br - rec[2].imag() * bi;
       if (fissionable_)
-        sig_f += (rf * base).real();
+        sig_f += rec[3].real() * br - rec[3].imag() * bi;
     };
     for (int i = win_start_[i_window]; i < win_end_[i_window]; ++i) {
-      accumulate(
-        gdata_(i, MP_EA), gdata_(i, MP_RS), gdata_(i, MP_RA), gdata_(i, MP_RF), xi);
+      accumulate(&gdata_(i, 0));
     }
     for (int j = 0; j < n_ext; ++j) {
-      accumulate(ext_data_(i_window, j, MP_EA), ext_data_(i_window, j, MP_RS),
-        ext_data_(i_window, j, MP_RA), ext_data_(i_window, j, MP_RF), xi);
+      accumulate(&ext_data_(i_window, j, 0));
     }
     return std::make_tuple(sig_s, sig_a, sig_f);
   }
