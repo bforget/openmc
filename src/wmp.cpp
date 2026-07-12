@@ -320,16 +320,24 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   int k1 = fw_off_[w + 1];
   int np = k1 - k0;
 
-  // One reciprocal per pole; accumulate the four collapsed transport sums
+  // One reciprocal per pole; accumulate the four collapsed transport sums.
+  // The reciprocal is hand-rolled (conjugate / |d|^2, one real division):
+  // std::complex division goes through the guarded __divc3 path and costs
+  // several times more, and poles never coincide with real sqrtE (Im != 0).
   constexpr int FAST_MAX_ACTIVE = 96;
   std::complex<double> phi[FAST_MAX_ACTIVE];
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
   for (int k = 0; k < np; ++k) {
-    phi[k] = 1.0 / (sqrtE - fw_pole_[k0 + k]);
-    el += (fw_r_el_[k0 + k] * phi[k]).real();
-    fis += (fw_r_fis_[k0 + k] * phi[k]).real();
-    dis += (fw_r_dis_[k0 + k] * phi[k]).real();
-    oth += (fw_r_oth_[k0 + k] * phi[k]).real();
+    double dr = sqrtE - fw_pole_[k0 + k].real();
+    double di = -fw_pole_[k0 + k].imag();
+    double inv = 1.0 / (dr * dr + di * di);
+    double pr = dr * inv;
+    double pi = -di * inv;
+    phi[k] = {pr, pi};
+    el += fw_r_el_[k0 + k].real() * pr - fw_r_el_[k0 + k].imag() * pi;
+    fis += fw_r_fis_[k0 + k].real() * pr - fw_r_fis_[k0 + k].imag() * pi;
+    dis += fw_r_dis_[k0 + k].real() * pr - fw_r_dis_[k0 + k].imag() * pi;
+    oth += fw_r_oth_[k0 + k].real() * pr - fw_r_oth_[k0 + k].imag() * pi;
   }
 
   // Partially-clamped channels (rare; only near their thresholds)
@@ -338,7 +346,8 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
       continue;
     double s = 0.0;
     for (int k = 0; k < np; ++k)
-      s += (fp_res_[part.res_off + k] * phi[k]).real();
+      s += fp_res_[part.res_off + k].real() * phi[k].real() -
+           fp_res_[part.res_off + k].imag() * phi[k].imag();
     switch (part.kind) {
     case 3:
       el += s;
