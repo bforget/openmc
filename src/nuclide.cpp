@@ -743,25 +743,35 @@ void Nuclide::calculate_xs(
     micro.index_grid = i_grid;
     micro.interp_factor = f;
 
-    // Calculate microscopic nuclide total cross section
-    micro.total =
-      (1.0 - f) * xs(i_grid, XS_TOTAL) + f * xs(i_grid + 1, XS_TOTAL);
+    // Fast-segment multipole? The grid indices above are still needed
+    // (channel-within-scattering sampling, partial fissions, secondary
+    // distributions, URR inelastic), but the transport cross sections
+    // come from the T=0 pole sums instead of the tabulated grids.
+    bool use_fast_mp = multipole_ && multipole_->fast_present_ &&
+                       p.E() > multipole_->E_max_ &&
+                       p.E() <= multipole_->fast_E_max_;
 
-    // Calculate microscopic nuclide absorption cross section
-    micro.absorption =
-      (1.0 - f) * xs(i_grid, XS_ABSORPTION) + f * xs(i_grid + 1, XS_ABSORPTION);
-
-    if (fissionable_) {
+    if (!use_fast_mp) {
       // Calculate microscopic nuclide total cross section
-      micro.fission =
-        (1.0 - f) * xs(i_grid, XS_FISSION) + f * xs(i_grid + 1, XS_FISSION);
+      micro.total =
+        (1.0 - f) * xs(i_grid, XS_TOTAL) + f * xs(i_grid + 1, XS_TOTAL);
 
-      // Calculate microscopic nuclide nu-fission cross section
-      micro.nu_fission = (1.0 - f) * xs(i_grid, XS_NU_FISSION) +
-                         f * xs(i_grid + 1, XS_NU_FISSION);
-    } else {
-      micro.fission = 0.0;
-      micro.nu_fission = 0.0;
+      // Calculate microscopic nuclide absorption cross section
+      micro.absorption = (1.0 - f) * xs(i_grid, XS_ABSORPTION) +
+                         f * xs(i_grid + 1, XS_ABSORPTION);
+
+      if (fissionable_) {
+        // Calculate microscopic nuclide total cross section
+        micro.fission =
+          (1.0 - f) * xs(i_grid, XS_FISSION) + f * xs(i_grid + 1, XS_FISSION);
+
+        // Calculate microscopic nuclide nu-fission cross section
+        micro.nu_fission = (1.0 - f) * xs(i_grid, XS_NU_FISSION) +
+                           f * xs(i_grid + 1, XS_NU_FISSION);
+      } else {
+        micro.fission = 0.0;
+        micro.nu_fission = 0.0;
+      }
     }
 
     // Calculate microscopic nuclide photon production cross section
@@ -806,15 +816,14 @@ void Nuclide::calculate_xs(
       }
     }
 
-    // Fast-segment multipole: override the transport cross sections with
-    // the T=0 pole sums. The grid indices/interp factor set above stay
-    // valid — channel-within-scattering sampling, partial fissions, and
-    // secondary distributions keep using the tabulated data (by design:
-    // poles carry the transport xs, ACE carries branching + secondaries).
-    // NOTE: URR ptables are not wired to the pole base yet — run with
-    // settings.ptables = False when using fast-segment WMP libraries.
-    if (multipole_ && multipole_->fast_present_ &&
-        p.E() > multipole_->E_max_ && p.E() <= multipole_->fast_E_max_) {
+    // Fast-segment multipole: transport cross sections from the T=0 pole
+    // sums (the tabulated interpolations above were skipped). Channel
+    // sampling, partial fissions, and secondary distributions keep using
+    // the tabulated data through the grid indices (by design: poles carry
+    // the transport xs, ACE carries branching + secondaries). With LSSF=1
+    // URR ptables on, calculate_urr_xs multiplies the band factors onto
+    // these pole values (see the pole_base gate there).
+    if (use_fast_mp) {
       double sig_t, sig_s, sig_a, sig_f;
       std::tie(sig_t, sig_s, sig_a, sig_f) =
         multipole_->evaluate_fast(p.E());
@@ -979,9 +988,18 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
     }
   }
 
-  // Multiply by smooth cross-section if needed
+  // Multiply by smooth cross-section if needed (LSSF=1: the band values
+  // are factors on the smooth base). When the fast-segment multipole
+  // covers this energy, micro.elastic/absorption/fission already hold the
+  // pole-evaluated base — exactly the File 3 data the ptables are factors
+  // of — so do not clobber micro.elastic with the tabulated value.
   if (urr.multiply_smooth_) {
-    calculate_elastic_xs(p);
+    bool pole_base = multipole_ && multipole_->fast_present_ &&
+                     p.E() > multipole_->E_max_ &&
+                     p.E() <= multipole_->fast_E_max_;
+    if (!pole_base) {
+      calculate_elastic_xs(p);
+    }
     elastic *= micro.elastic;
     capture *= (micro.absorption - micro.fission);
     fission *= micro.fission;
