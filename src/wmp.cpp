@@ -402,6 +402,12 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
     int n_ext = ext_data_.shape(1);
 
+    // xi = sqrt(kT/AWR) in sqrt(eV); sqrtkT = sqrt(kT)
+    double xi = (sqrtkT > 0.0) ? sqrtkT / sqrt_awr_ : 0.0;
+    double inv_xi = (xi > 0.0) ? 1.0 / xi : 0.0;
+    // Loop-invariant i*sqrt(pi)/xi
+    std::complex<double> cxi(0.0, SQRT_PI * inv_xi);
+
     auto accumulate = [&](const std::complex<double>& p,
                         const std::complex<double>& rs,
                         const std::complex<double>& ra,
@@ -412,7 +418,7 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         // free-gas broadening and is always evaluated unbroadened.
         base = 1.0 / (sqrtE - p);
       } else {
-        std::complex<double> z = (p - sqrtE) / xi;
+        std::complex<double> z = (p - sqrtE) * inv_xi;
         if (std::abs(z.real()) > 1.0e2 || std::abs(z.imag()) > 1.0e2) {
           // |z| >> 1: broadening changes the tail by O(1/|z|^2) < 1e-4,
           // while the Faddeeva form suffers catastrophic cancellation
@@ -420,11 +426,28 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
           // background poles evaluated at very low E. Use the 0K form.
           base = 1.0 / (sqrtE - p);
         } else {
-          // (1/E) Re[r ((u+p) + p^2 (i sqrt(pi)/xi) w((p-u)/xi))]
-          std::complex<double> w_val = faddeeva(z);
-          base = ((sqrtE + p) +
-                   p * p * (std::complex<double>(0.0, SQRT_PI) / xi) * w_val) *
-                 invE;
+          double z2 = z.real() * z.real() + z.imag() * z.imag();
+          if (z2 >= 25.0) {
+            // Moderate |z| (5..100): substituting the 3-term Laurent
+            // series of w(z) into the base ANALYTICALLY cancels the huge
+            // (u+p) vs p^2*w terms (naive substitution amplifies the
+            // series truncation by the ~1e6 cancellation ratio):
+            //   base = [1 + (p/u)^2 c] / (u - p),
+            //   c = t (1/2 + t (3/4 + 15 t / 8)),  t = xi^2/(u-p)^2 = 1/z^2
+            // c -> 0 recovers the 0K form; truncation <= ~3e-5 of c.
+            std::complex<double> d = sqrtE - p;
+            double m2 = d.real() * d.real() + d.imag() * d.imag();
+            double minv = 1.0 / m2;
+            std::complex<double> inv_d(d.real() * minv, -d.imag() * minv);
+            std::complex<double> t = (xi * inv_d) * (xi * inv_d);
+            std::complex<double> c =
+              t * (0.5 + t * (0.75 + t * 1.875));
+            base = (1.0 + p * p * invE * c) * inv_d;
+          } else {
+            // (1/E) Re[r ((u+p) + p^2 (i sqrt(pi)/xi) w((p-u)/xi))]
+            std::complex<double> w_val = faddeeva(z);
+            base = ((sqrtE + p) + p * p * cxi * w_val) * invE;
+          }
         }
       }
       sig_s += (rs * base).real();
@@ -432,9 +455,6 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       if (fissionable_)
         sig_f += (rf * base).real();
     };
-
-    // xi = sqrt(kT/AWR) in sqrt(eV); sqrtkT = sqrt(kT)
-    double xi = (sqrtkT > 0.0) ? sqrtkT / sqrt_awr_ : 0.0;
     for (int i = win_start_[i_window]; i < win_end_[i_window]; ++i) {
       accumulate(
         gdata_(i, MP_EA), gdata_(i, MP_RS), gdata_(i, MP_RA), gdata_(i, MP_RF), xi);
