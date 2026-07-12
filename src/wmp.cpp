@@ -236,11 +236,7 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     fw_off_[w + 1] = fw_off_[w] + np;
   }
   int n_flat = fw_off_[n_win];
-  fw_pole_.assign(n_flat, 0.0);
-  fw_r_el_.assign(n_flat, 0.0);
-  fw_r_fis_.assign(n_flat, 0.0);
-  fw_r_dis_.assign(n_flat, 0.0);
-  fw_r_oth_.assign(n_flat, 0.0);
+  fw_data_.assign((size_t)n_flat * FW_STRIDE, 0.0);
 
   for (int w = 0; w < n_win; ++w) {
     double e_lo = fast_bounds_[w] * fast_bounds_[w];
@@ -248,9 +244,9 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     int np = wend[w] - wstart[w];
     int base = fw_off_[w];
     for (int k = 0; k < np; ++k)
-      fw_pole_[base + k] = poles[wstart[w] + k];
+      fw_data_[(size_t)(base + k) * FW_STRIDE] = poles[wstart[w] + k];
     for (int j = 0; j < n_ext; ++j)
-      fw_pole_[base + np + j] = xp(w, j);
+      fw_data_[(size_t)(base + np + j) * FW_STRIDE] = xp(w, j);
 
     for (int c = 0; c < n_mts; ++c) {
       // Overlap of the channel's active range with this window
@@ -262,14 +258,16 @@ void WindowedMultipole::read_fast_segment(hid_t group)
       // sliver between the window edge and the clamp.
       bool full = (e_on[c] <= e_lo) && (e_off[c] >= e_hi);
       if (full) {
-        auto& acc = (kind[c] == 3)   ? fw_r_el_
-                    : (kind[c] == 1) ? fw_r_fis_
-                    : (kind[c] == 2) ? fw_r_dis_
-                                     : fw_r_oth_;
+        // Interleaved slot: 1 elastic, 2 fission, 3 disappearance, 4 other
+        int slot = (kind[c] == 3)   ? 1
+                   : (kind[c] == 1) ? 2
+                   : (kind[c] == 2) ? 3
+                                    : 4;
         for (int k = 0; k < np; ++k)
-          acc[base + k] += residues(wstart[w] + k, c);
+          fw_data_[(size_t)(base + k) * FW_STRIDE + slot] +=
+            residues(wstart[w] + k, c);
         for (int j = 0; j < n_ext; ++j)
-          acc[base + np + j] += xr(w, j, c);
+          fw_data_[(size_t)(base + np + j) * FW_STRIDE + slot] += xr(w, j, c);
       } else {
         // Partially active: keep separate, clamp at evaluation time
         FastPartial part;
@@ -320,24 +318,29 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   int k1 = fw_off_[w + 1];
   int np = k1 - k0;
 
-  // One reciprocal per pole; accumulate the four collapsed transport sums.
-  // The reciprocal is hand-rolled (conjugate / |d|^2, one real division):
+  // One reciprocal per pole; accumulate the four collapsed transport sums
+  // from the interleaved per-pole record (one memory stream). The
+  // reciprocal is hand-rolled (conjugate / |d|^2, one real division):
   // std::complex division goes through the guarded __divc3 path and costs
   // several times more, and poles never coincide with real sqrtE (Im != 0).
+  // phi is stored only when the window has partially-clamped channels.
   constexpr int FAST_MAX_ACTIVE = 96;
   std::complex<double> phi[FAST_MAX_ACTIVE];
+  bool need_phi = !fast_partials_[w].empty();
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
-  for (int k = 0; k < np; ++k) {
-    double dr = sqrtE - fw_pole_[k0 + k].real();
-    double di = -fw_pole_[k0 + k].imag();
+  const std::complex<double>* rec = &fw_data_[(size_t)k0 * FW_STRIDE];
+  for (int k = 0; k < np; ++k, rec += FW_STRIDE) {
+    double dr = sqrtE - rec[0].real();
+    double di = -rec[0].imag();
     double inv = 1.0 / (dr * dr + di * di);
     double pr = dr * inv;
     double pi = -di * inv;
-    phi[k] = {pr, pi};
-    el += fw_r_el_[k0 + k].real() * pr - fw_r_el_[k0 + k].imag() * pi;
-    fis += fw_r_fis_[k0 + k].real() * pr - fw_r_fis_[k0 + k].imag() * pi;
-    dis += fw_r_dis_[k0 + k].real() * pr - fw_r_dis_[k0 + k].imag() * pi;
-    oth += fw_r_oth_[k0 + k].real() * pr - fw_r_oth_[k0 + k].imag() * pi;
+    if (need_phi)
+      phi[k] = {pr, pi};
+    el += rec[1].real() * pr - rec[1].imag() * pi;
+    fis += rec[2].real() * pr - rec[2].imag() * pi;
+    dis += rec[3].real() * pr - rec[3].imag() * pi;
+    oth += rec[4].real() * pr - rec[4].imag() * pi;
   }
 
   // Partially-clamped channels (rare; only near their thresholds)

@@ -136,11 +136,10 @@ public:
   vector<int> fast_cell_first_;   //!< O(1) index over fast windows
   double fast_cell_inv_du_ {0.0};
   vector<int> fw_off_;            //!< Flattened pole offsets [n_fwin+1]
-  vector<std::complex<double>> fw_pole_;  //!< Poles incl. externals
-  vector<std::complex<double>> fw_r_el_;  //!< Collapsed elastic residues
-  vector<std::complex<double>> fw_r_fis_; //!< Collapsed fission residues
-  vector<std::complex<double>> fw_r_dis_; //!< Collapsed disappearance res.
-  vector<std::complex<double>> fw_r_oth_; //!< Collapsed other-scatter res.
+  // Interleaved per-pole record (single memory stream per lookup):
+  // [pole, r_elastic, r_fission, r_disappearance, r_other] x n_flat
+  static constexpr int FW_STRIDE = 5;
+  vector<std::complex<double>> fw_data_;
   struct FastPartial {
     double E_on;  //!< Clamp: zero below this energy [eV]
     double E_off; //!< Clamp: zero above this energy [eV]
