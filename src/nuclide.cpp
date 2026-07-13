@@ -708,48 +708,56 @@ void Nuclide::calculate_xs(
       break;
     }
 
-    // Determine the energy grid index using a logarithmic mapping to
-    // reduce the energy range over which a binary search needs to be
-    // performed
-
     const auto& grid {grid_[i_temp]};
     const auto& xs {xs_[i_temp]};
 
-    int i_grid;
-    if (p.E() < grid.energy.front()) {
-      i_grid = 0;
-    } else if (p.E() > grid.energy.back()) {
-      i_grid = grid.energy.size() - 2;
-    } else {
-      // Determine bounding indices based on which equal log-spaced
-      // interval the energy is in
-      int i_low = grid.grid_index[i_log_union];
-      int i_high = grid.grid_index[i_log_union + 1] + 1;
-
-      // Perform binary search over reduced range
-      i_grid = i_low + lower_bound_index(
-                         &grid.energy[i_low], &grid.energy[i_high], p.E());
-    }
-
-    // check for rare case where two energy points are the same
-    if (grid.energy[i_grid] == grid.energy[i_grid + 1])
-      ++i_grid;
-
-    // calculate interpolation factor
-    f = (p.E() - grid.energy[i_grid]) /
-        (grid.energy[i_grid + 1] - grid.energy[i_grid]);
-
     micro.index_temp = i_temp;
-    micro.index_grid = i_grid;
-    micro.interp_factor = f;
 
-    // Fast-segment multipole? The grid indices above are still needed
-    // (channel-within-scattering sampling, partial fissions, secondary
-    // distributions, URR inelastic), but the transport cross sections
-    // come from the T=0 pole sums instead of the tabulated grids.
+    // Fast-segment multipole? The transport cross sections come from the
+    // T=0 pole sums instead of the tabulated grids.
     bool use_fast_mp = multipole_ && multipole_->fast_present_ &&
                        p.E() > multipole_->E_max_ &&
                        p.E() <= multipole_->fast_E_max_;
+
+    // LAZY GRID INDEXING: a fast-multipole lookup whose transport xs come
+    // entirely from poles needs the ACE grid index only (a) at a collision
+    // (channel-fallback / secondary sampling / tallies) or (b) on THIS
+    // flight lookup if it is in the URR band (calculate_urr_xs adds an ACE
+    // inelastic component). Defer the expensive binary search otherwise --
+    // most flight lookups never collide in this nuclide, so it is pure
+    // saving; ensure_grid_index() recomputes it on demand.
+    bool urr_now = settings::urr_ptables_on && urr_present_ &&
+                   urr_data_[i_temp].energy_in_bounds(p.E());
+    bool lazy_grid =
+      use_fast_mp && !urr_now && !simulation::need_depletion_rx;
+
+    int i_grid = 0;
+    if (lazy_grid) {
+      micro.index_grid = C_NONE; // sentinel: deferred
+      micro.interp_factor = 0.0;
+    } else {
+      // Determine the energy grid index using a logarithmic mapping to
+      // reduce the energy range over which a binary search needs to be
+      // performed
+      if (p.E() < grid.energy.front()) {
+        i_grid = 0;
+      } else if (p.E() > grid.energy.back()) {
+        i_grid = grid.energy.size() - 2;
+      } else {
+        int i_low = grid.grid_index[i_log_union];
+        int i_high = grid.grid_index[i_log_union + 1] + 1;
+        i_grid = i_low + lower_bound_index(
+                           &grid.energy[i_low], &grid.energy[i_high], p.E());
+      }
+      // check for rare case where two energy points are the same
+      if (grid.energy[i_grid] == grid.energy[i_grid + 1])
+        ++i_grid;
+      // calculate interpolation factor
+      f = (p.E() - grid.energy[i_grid]) /
+          (grid.energy[i_grid + 1] - grid.energy[i_grid]);
+      micro.index_grid = i_grid;
+      micro.interp_factor = f;
+    }
 
     if (!use_fast_mp) {
       // Calculate microscopic nuclide total cross section
@@ -859,6 +867,45 @@ void Nuclide::calculate_xs(
 
   micro.last_E = p.E();
   micro.last_sqrtkT = p.sqrtkT();
+}
+
+void Nuclide::ensure_grid_index(Particle& p)
+{
+  // Compute the ACE energy-grid index if it was deferred (lazy grid
+  // indexing, see calculate_xs). Called at collision time for the sampled
+  // nuclide so all downstream consumers (channel fallback, secondary
+  // sampling, tallies) see a valid index. No-op if already computed.
+  auto& micro {p.neutron_xs(index_)};
+  // Already computed, or the resolved-multipole case (index_temp == C_NONE)
+  // which sets index_grid = C_NONE deliberately and needs no grid (resolved-
+  // range collisions are elastic-only, below any inelastic threshold).
+  if (micro.index_grid != C_NONE || micro.index_temp == C_NONE)
+    return;
+
+  int i_temp = micro.index_temp;
+  const auto& grid {grid_[i_temp]};
+
+  // Recompute the log-union index (as material.cpp does pre-calculate_xs)
+  int neutron = ParticleType::neutron().transport_index();
+  int i_log_union =
+    std::log(p.E() / data::energy_min[neutron]) / simulation::log_spacing;
+
+  int i_grid;
+  if (p.E() < grid.energy.front()) {
+    i_grid = 0;
+  } else if (p.E() > grid.energy.back()) {
+    i_grid = grid.energy.size() - 2;
+  } else {
+    int i_low = grid.grid_index[i_log_union];
+    int i_high = grid.grid_index[i_log_union + 1] + 1;
+    i_grid = i_low +
+             lower_bound_index(&grid.energy[i_low], &grid.energy[i_high], p.E());
+  }
+  if (grid.energy[i_grid] == grid.energy[i_grid + 1])
+    ++i_grid;
+  micro.index_grid = i_grid;
+  micro.interp_factor = (p.E() - grid.energy[i_grid]) /
+                        (grid.energy[i_grid + 1] - grid.energy[i_grid]);
 }
 
 void Nuclide::calculate_sab_xs(int i_sab, double sab_frac, Particle& p)

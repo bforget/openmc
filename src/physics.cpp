@@ -110,6 +110,11 @@ void sample_neutron_reaction(Particle& p)
   // Save which nuclide particle had collision with
   p.event_nuclide() = i_nuclide;
 
+  // Lazy grid indexing: the collision nuclide's ACE grid index may have been
+  // deferred on the flight-path lookup (fast-multipole nuclides). Compute it
+  // now so the collision kernel / secondary sampling / tallies have it.
+  data::nuclides[i_nuclide]->ensure_grid_index(p);
+
   // Create fission bank sites. Note that while a fission reaction is sampled,
   // it never actually "happens", i.e. the weight of the particle does not
   // change when sampling fission sites. The following block handles all

@@ -56,6 +56,11 @@ public:
   //! \param[in,out] p  Particle object
   void calculate_xs(int i_sab, int i_log_union, double sab_frac, Particle& p);
 
+  //! Compute the ACE energy-grid index if it was deferred (lazy grid
+  //! indexing). Call at collision time for the sampled nuclide.
+  //! \param[in,out] p  Particle object
+  void ensure_grid_index(Particle& p);
+
   //! Calculate thermal scattering cross section
   //
   //! \param[in] i_sab  Index in data::thermal_scatt
