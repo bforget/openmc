@@ -87,6 +87,22 @@ public:
   //!         disappearance), and fission cross sections in [b]
   std::tuple<double, double, double, double> evaluate_fast(double E) const;
 
+  //! \brief Evaluate every fitted fast channel at E (collision kernel).
+  //!
+  //! One set of pole reciprocals; fills out[c] with the pole cross section
+  //! of channel c (0 outside its clamp). Used only at collisions to select
+  //! the scattering/reaction channel from poles rather than ACE tables.
+  //!
+  //! \param E   Incident neutron energy [eV], seam < E <= fast_E_max_
+  //! \param out Output buffer, size >= fast_n_mts_
+  void evaluate_fast_channels(double E, double* out) const;
+
+  //! Channel index for a given MT in the fast segment, or -1 if not fit.
+  int fast_channel_of_mt(int mt) const
+  {
+    return (mt >= 0 && mt < 900) ? fast_mt_to_chan_[mt] : -1;
+  }
+
   // Data members
   std::string name_;               //!< Name of nuclide
   double E_min_;                   //!< Minimum energy in [eV]
@@ -148,6 +164,20 @@ public:
   };
   vector<vector<FastPartial>> fast_partials_; //!< Per-window partial channels
   vector<std::complex<double>> fp_res_;       //!< Partial-channel residues
+
+  // Per-channel fast residues for the COLLISION kernel (channel selection).
+  // Kept alongside the collapsed transport residues; read only at collisions,
+  // never on the flight path. fw_chan_res_ is laid out [flat_pole * n_mts +
+  // channel], flat_pole in the same order as fw_data_ (pool poles then the 4
+  // externals per window). fast_mts_ gives the MT of each channel; the clamps
+  // gate each channel to [on, off].
+  int fast_n_mts_ {0};
+  vector<int> fast_mts_;                       //!< MT number per channel
+  vector<double> fast_mt_on_;                  //!< Per-channel turn-on [eV]
+  vector<double> fast_mt_off_;                 //!< Per-channel turn-off [eV]
+  vector<std::complex<double>> fw_chan_res_;   //!< [n_flat * n_mts] residues
+  array<int, 900> fast_mt_to_chan_;            //!< MT -> channel index, -1 none
+
   // Pool: [pole, r_elastic, r_absorption, r_fission] like data_ columns
   tensor::Tensor<std::complex<double>> gdata_; //!< (n_pool, 4)
   // Externals: 4 per window, same column convention

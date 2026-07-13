@@ -732,13 +732,32 @@ void scatter(Particle& p, int i_nuclide)
     // =======================================================================
     // INELASTIC SCATTERING
 
+    // Fast-segment multipole: select the inelastic level from POLE channel
+    // cross sections rather than the tabulated ACE reaction xs. The flight
+    // path already uses the collapsed pole sum; here we evaluate the
+    // individual channels (one set of reciprocals) to pick which one. A
+    // channel not present in the fast fit falls back to the ACE table.
+    bool fast = nuc->multipole_ && nuc->multipole_->fast_present_ &&
+                p.E() > nuc->multipole_->E_max_ &&
+                p.E() <= nuc->multipole_->fast_E_max_;
+    double chan_xs[256];
+    if (fast)
+      nuc->multipole_->evaluate_fast_channels(p.E(), chan_xs);
+
     int n = nuc->index_inelastic_scatter_.size();
     int i = 0;
     for (int j = 0; j < n && prob < cutoff; ++j) {
       i = nuc->index_inelastic_scatter_[j];
 
       // add to cumulative probability
-      prob += nuc->reactions_[i]->xs(micro);
+      double rxs;
+      if (fast) {
+        int c = nuc->multipole_->fast_channel_of_mt(nuc->reactions_[i]->mt_);
+        rxs = (c >= 0) ? chan_xs[c] : nuc->reactions_[i]->xs(micro);
+      } else {
+        rxs = nuc->reactions_[i]->xs(micro);
+      }
+      prob += rxs;
     }
 
     // Perform collision physics for inelastic scattering

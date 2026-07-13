@@ -238,6 +238,23 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   int n_flat = fw_off_[n_win];
   fw_data_.assign((size_t)n_flat * FW_STRIDE, 0.0);
 
+  // Per-channel residues for the collision kernel: keep the full n_mts
+  // columns (the collapse above is only for the flight path). MT list,
+  // clamps, and the MT -> channel index map.
+  fast_n_mts_ = n_mts;
+  fast_mts_.resize(n_mts);
+  fast_mt_on_.resize(n_mts);
+  fast_mt_off_.resize(n_mts);
+  fast_mt_to_chan_.fill(-1);
+  for (int c = 0; c < n_mts; ++c) {
+    fast_mts_[c] = mts[c];
+    fast_mt_on_[c] = e_on[c];
+    fast_mt_off_[c] = e_off[c];
+    if (mts[c] >= 0 && mts[c] < 900)
+      fast_mt_to_chan_[mts[c]] = c;
+  }
+  fw_chan_res_.assign((size_t)n_flat * n_mts, 0.0);
+
   for (int w = 0; w < n_win; ++w) {
     double e_lo = fast_bounds_[w] * fast_bounds_[w];
     double e_hi = fast_bounds_[w + 1] * fast_bounds_[w + 1];
@@ -247,6 +264,14 @@ void WindowedMultipole::read_fast_segment(hid_t group)
       fw_data_[(size_t)(base + k) * FW_STRIDE] = poles[wstart[w] + k];
     for (int j = 0; j < n_ext; ++j)
       fw_data_[(size_t)(base + np + j) * FW_STRIDE] = xp(w, j);
+
+    // Per-channel residues (uncollapsed), same flattened pole order
+    for (int c = 0; c < n_mts; ++c) {
+      for (int k = 0; k < np; ++k)
+        fw_chan_res_[(size_t)(base + k) * n_mts + c] = residues(wstart[w] + k, c);
+      for (int j = 0; j < n_ext; ++j)
+        fw_chan_res_[(size_t)(base + np + j) * n_mts + c] = xr(w, j, c);
+    }
 
     for (int c = 0; c < n_mts; ++c) {
       // Overlap of the channel's active range with this window
@@ -374,6 +399,49 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
 
   double total = el + fis + dis + oth;
   return {total, el, dis + fis, fis};
+}
+
+void WindowedMultipole::evaluate_fast_channels(double E, double* out) const
+{
+  double sqrtE = std::sqrt(E);
+
+  // O(1) window lookup (same as evaluate_fast)
+  int n_win = fw_off_.size() - 1;
+  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
+  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
+  int w = fast_cell_first_[cell];
+  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
+    ++w;
+
+  int k0 = fw_off_[w];
+  int np = fw_off_[w + 1] - k0;
+  int nm = fast_n_mts_;
+
+  // One reciprocal per pole (pr, pi) = (Re(1/d), Im(1/d)), reused across
+  // all channels, same convention as evaluate_fast.
+  constexpr int FAST_MAX_ACTIVE = 96;
+  double pr_[FAST_MAX_ACTIVE], pi_[FAST_MAX_ACTIVE];
+  const std::complex<double>* rec = &fw_data_[(size_t)k0 * FW_STRIDE];
+  for (int k = 0; k < np; ++k, rec += FW_STRIDE) {
+    double dr = sqrtE - rec[0].real();
+    double di = -rec[0].imag();
+    double inv = 1.0 / (dr * dr + di * di);
+    pr_[k] = dr * inv;
+    pi_[k] = -di * inv;
+  }
+
+  const std::complex<double>* cr = &fw_chan_res_[(size_t)k0 * nm];
+  for (int c = 0; c < nm; ++c) {
+    if (E < fast_mt_on_[c] || E > fast_mt_off_[c]) {
+      out[c] = 0.0;
+      continue;
+    }
+    double s = 0.0; // Re[r/(u-p)] = r.re*Re(1/d) - r.im*Im(1/d)
+    for (int k = 0; k < np; ++k)
+      s += cr[(size_t)k * nm + c].real() * pr_[k] -
+           cr[(size_t)k * nm + c].imag() * pi_[k];
+    out[c] = (s > 0.0) ? s : 0.0;
+  }
 }
 
 std::tuple<double, double, double> WindowedMultipole::evaluate(
