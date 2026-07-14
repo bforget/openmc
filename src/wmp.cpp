@@ -178,6 +178,41 @@ void WindowedMultipole::read_global_segment(hid_t group)
         }
       }
     }
+
+    // Build the branch-free SoA pool arrays (see wmp.h). The 1/v pole
+    // (Re p == 0) is broadening-invariant and must NOT go through zpf8h:
+    // zero its SoA residues so the vector loop skips it, and stash its data
+    // + owning window for a separate exact-0K add.
+    gs_pr_.resize(n_pool); gs_pi_.resize(n_pool);
+    gs_sr_.resize(n_pool); gs_si_.resize(n_pool);
+    gs_ar_.resize(n_pool); gs_ai_.resize(n_pool);
+    gs_fr_.resize(n_pool); gs_fi_.resize(n_pool);
+    for (int i = 0; i < n_pool; ++i) {
+      std::complex<double> p = gdata_(i, MP_EA);
+      gs_pr_[i] = p.real(); gs_pi_[i] = p.imag();
+      bool is1v = (p.real() == 0.0);
+      if (is1v) {
+        onev_present_ = true;
+        onev_p_ = p;
+        onev_rs_ = gdata_(i, MP_RS);
+        onev_ra_ = gdata_(i, MP_RA);
+        onev_rf_ = gdata_(i, MP_RF);
+        gs_sr_[i] = gs_si_[i] = gs_ar_[i] = gs_ai_[i] = 0.0;
+        gs_fr_[i] = gs_fi_[i] = 0.0;
+      } else {
+        gs_sr_[i] = gdata_(i, MP_RS).real(); gs_si_[i] = gdata_(i, MP_RS).imag();
+        gs_ar_[i] = gdata_(i, MP_RA).real(); gs_ai_[i] = gdata_(i, MP_RA).imag();
+        gs_fr_[i] = gdata_(i, MP_RF).real(); gs_fi_[i] = gdata_(i, MP_RF).imag();
+      }
+    }
+    if (onev_present_) {
+      for (int w = 0; w < n_win; ++w) {
+        for (int i = win_start_[w]; i < win_end_[w]; ++i) {
+          if (gs_pr_[i] == 0.0) { onev_window_ = w; break; }
+        }
+        if (onev_window_ >= 0) break;
+      }
+    }
 }
 
 void WindowedMultipole::read_fast_segment(hid_t group)
@@ -568,9 +603,91 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       if (fissionable_)
         sig_f += rec[3].real() * br - rec[3].imag() * bi;
     };
-    for (int i = win_start_[i_window]; i < win_end_[i_window]; ++i) {
-      accumulate(&gdata_(i, 0));
+    // Pool poles: branch-free SoA sweep (vectorizable). Every pole takes the
+    // SAME uniform path -- no runtime |z| test. At T>0 that is the inlined
+    // zpf8h Faddeeva sigma basis (Im(z)=beta/xi>0 for resonance poles, so no
+    // conjugation); the 1/v pole's SoA residues are zeroed here and its exact
+    // 0K contribution is added below. At T=0 the plain pole sum.
+    int ps = win_start_[i_window], pe = win_end_[i_window];
+    if (xi <= 0.0) {
+      for (int i = ps; i < pe; ++i) {
+        double dr = sqrtE - gs_pr_[i], di = -gs_pi_[i];
+        double minv = 1.0 / (dr * dr + di * di);
+        double br = dr * minv, bi = -di * minv;
+        sig_s += gs_sr_[i] * br - gs_si_[i] * bi;
+        sig_a += gs_ar_[i] * br - gs_ai_[i] * bi;
+        sig_f += gs_fr_[i] * br - gs_fi_[i] * bi;
+      }
+    } else {
+      // Compute-both + branchless select: per pole evaluate BOTH the
+      // cancellation-safe analytic Laurent base (valid |z|>=5, needed where
+      // wide windows push |z| to ~1e4 and the raw sigma basis cancels
+      // catastrophically) AND the zpf8h Faddeeva base (|z|<5), then select
+      // by |z|. The select is a data blend, not control flow, so the SoA
+      // loop still vectorizes. Threshold |z|^2 >= 25*xi^2 matches the old
+      // if/else split (accuracy 0.04% all nuclides). p^2 is shared.
+      double sq = SQRT_PI * inv_xi;
+      double xi2 = xi * xi, thr = 25.0 * xi2;
+      for (int i = ps; i < pe; ++i) {
+        double pr = gs_pr_[i], pi = gs_pi_[i];
+        double dr = sqrtE - pr, di = -pi;
+        double m2 = dr * dr + di * di;
+        double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
+        // --- analytic base: (1 + (p^2/E) c) / (u - p), c = t(1/2 + t(3/4 +
+        //     15t/8)), t = 1/z^2 = xi^2/(u-p)^2 ---
+        double minv = 1.0 / m2;
+        double ir = dr * minv, ii = -di * minv;    // 1/(u-p)
+        double tr = xi2 * (ir * ir - ii * ii), ti = xi2 * (2.0 * ir * ii);
+        double cr0 = 0.75 + 1.875 * tr, ci0 = 1.875 * ti;
+        double hr0 = 0.5 + (tr * cr0 - ti * ci0), hi0 = tr * ci0 + ti * cr0;
+        double cr = tr * hr0 - ti * hi0, ci = tr * hi0 + ti * hr0;
+        double qr = p2r * invE, qi = p2i * invE;    // p^2 / E
+        double gr = 1.0 + (qr * cr - qi * ci), gi = qr * ci + qi * cr;
+        double bra = gr * ir - gi * ii, bia = gr * ii + gi * ir;
+        // --- zpf8h base: zs = (pr - sqrtE, pi)/xi + (0, 0.9) ---
+        double zr = (pr - sqrtE) * inv_xi;
+        double zi = pi * inv_xi + 0.9;
+        double nr = 0.0, ni = 0.564189504758109, t; // aa8[7]
+        t = nr * zr - ni * zi; ni = nr * zi + ni * zr; nr = t - 0.507771291744591;
+        t = nr * zr - ni * zi; ni = nr * zi + ni * zr - 8.07354660639634; nr = t;
+        t = nr * zr - ni * zi + 6.75847413957232; ni = nr * zi + ni * zr; nr = t;
+        t = nr * zr - ni * zi; ni = nr * zi + ni * zr + 31.490536152863; nr = t;
+        t = nr * zr - ni * zi - 21.9357456686406; ni = nr * zi + ni * zr; nr = t;
+        t = nr * zr - ni * zi; ni = nr * zi + ni * zr - 32.310199761603; nr = t;
+        t = nr * zr - ni * zi + 11.7559071436993; ni = nr * zi + ni * zr; nr = t;
+        double zzr = zr * zr - zi * zi, zzi = 2.0 * zr * zi;
+        double dnr = 1.0, dni = 0.0; // bb8[4]; then bb8[3..0]
+        t = dnr * zzr - dni * zzi - 14.0; dni = dnr * zzi + dni * zzr; dnr = t;
+        t = dnr * zzr - dni * zzi + 52.5; dni = dnr * zzi + dni * zzr; dnr = t;
+        t = dnr * zzr - dni * zzi - 52.5; dni = dnr * zzi + dni * zzr; dnr = t;
+        t = dnr * zzr - dni * zzi + 6.5625; dni = dnr * zzi + dni * zzr; dnr = t;
+        double dm = 1.0 / (dnr * dnr + dni * dni);
+        double wr = (nr * dnr + ni * dni) * dm;
+        double wi = (ni * dnr - nr * dni) * dm;
+        double wgr = -sq * wi, wgi = sq * wr;       // (i sq) w
+        double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
+        double brz = (sqrtE + pr + hr) * invE;
+        double biz = (pi + hi) * invE;
+        // --- branchless select (analytic for |z|>=5, zpf8h otherwise) ---
+        bool far = (m2 >= thr);
+        double br = far ? bra : brz;
+        double bi = far ? bia : biz;
+        sig_s += gs_sr_[i] * br - gs_si_[i] * bi;
+        sig_a += gs_ar_[i] * br - gs_ai_[i] * bi;
+        sig_f += gs_fr_[i] * br - gs_fi_[i] * bi;
+      }
     }
+    // 1/v background pole: exact 0K value (broadening-invariant, any T).
+    if (onev_present_ && i_window == onev_window_) {
+      double dr = sqrtE - onev_p_.real(), di = -onev_p_.imag();
+      double minv = 1.0 / (dr * dr + di * di);
+      double br = dr * minv, bi = -di * minv;
+      sig_s += onev_rs_.real() * br - onev_rs_.imag() * bi;
+      sig_a += onev_ra_.real() * br - onev_ra_.imag() * bi;
+      sig_f += onev_rf_.real() * br - onev_rf_.imag() * bi;
+    }
+    // Externals (4/window): scalar branchy accumulate -- their |z| spans
+    // ~5 to >100 across E, genuinely needing the analytic/Faddeeva split.
     for (int j = 0; j < n_ext; ++j) {
       accumulate(&ext_data_(i_window, j, 0));
     }

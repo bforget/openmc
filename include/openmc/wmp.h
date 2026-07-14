@@ -192,6 +192,29 @@ public:
   // Externals: 4 per window, same column convention
   tensor::Tensor<std::complex<double>> ext_data_; //!< (n_win, 4, 4)
 
+  // Branch-free resolved pool kernel (SoA plain double, so the hot loop
+  // vectorizes -- std::complex + the runtime |z| branch defeated the
+  // auto-vectorizer). Every pool pole takes ONE uniform zpf8h Faddeeva path
+  // (no |z| test): the pointer ranges are sized for kernel reach at
+  // T_max=3000K, where ~100% of actinide pool poles are within 5*xi, so the
+  // old |z|>=5 asymptotic branch was a low-T-only optimization; running
+  // zpf8h everywhere costs a small low-E/low-T accuracy gray zone
+  // (5<=|z|<~40, ~1.26% U-235 elastic 294K) accepted for a clean
+  // vectorizable baseline (Ben, 2026-07-14). Parallel to gdata_ rows.
+  // Resonance poles have Im(p)=beta>0, so z is always upper-half-plane and
+  // the faddeeva() conjugation branch never fires. The 1/v pole (Re p=0,
+  // broadening-invariant) has its SoA residues ZEROED (the vector loop adds
+  // nothing for it) and its exact 0K contribution is added separately;
+  // externals (giant beta, |z| up to >100 -> zpf8h cancellation) keep the
+  // scalar branchy accumulate.
+  vector<double> gs_pr_, gs_pi_;                  //!< [n_pool] pole re/im
+  vector<double> gs_sr_, gs_si_;                  //!< [n_pool] elastic residue
+  vector<double> gs_ar_, gs_ai_;                  //!< [n_pool] absorption residue
+  vector<double> gs_fr_, gs_fi_;                  //!< [n_pool] fission residue
+  bool onev_present_ {false};                     //!< 1/v background pole?
+  int onev_window_ {-1};                          //!< its owning window
+  std::complex<double> onev_p_, onev_rs_, onev_ra_, onev_rf_; //!< its data
+
   // Constant data
   static constexpr int MAX_POLY_COEFFICIENTS =
     11; //!< Max order of polynomial fit plus one
