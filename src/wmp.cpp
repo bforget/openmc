@@ -619,62 +619,85 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         sig_f += gs_fr_[i] * br - gs_fi_[i] * bi;
       }
     } else {
-      // Compute-both + branchless select: per pole evaluate BOTH the
-      // cancellation-safe analytic Laurent base (valid |z|>=5, needed where
-      // wide windows push |z| to ~1e4 and the raw sigma basis cancels
-      // catastrophically) AND the zpf8h Faddeeva base (|z|<5), then select
-      // by |z|. The select is a data blend, not control flow, so the SoA
-      // loop still vectorizes. Threshold |z|^2 >= 25*xi^2 matches the old
-      // if/else split (accuracy 0.04% all nuclides). p^2 is shared.
+      // Compute-both + branchless select, LOOP-FISSIONED so each pass is
+      // small enough to auto-vectorize. One big loop did NOT vectorize:
+      // ~40 live doubles/iteration spilled to a temp array ("no vectype")
+      // and the ternary select read as "control flow". Split into four
+      // straight-line passes over small stack temps (windows are <=~47
+      // poles; chunk at MAXP for robustness): (1) analytic Laurent base,
+      // (2) zpf8h Faddeeva base, (3) arithmetic select by |z|^2>=25*xi^2
+      // (== the old if/else split, accuracy 0.04% all nuclides), (4) residue
+      // reduction. Both bases are computed for every pole; vectorization
+      // hides the 2x. The 1/v pole has zeroed SoA residues so pass 4 skips
+      // it; externals stay scalar below.
       double sq = SQRT_PI * inv_xi;
       double xi2 = xi * xi, thr = 25.0 * xi2;
-      for (int i = ps; i < pe; ++i) {
-        double pr = gs_pr_[i], pi = gs_pi_[i];
-        double dr = sqrtE - pr, di = -pi;
-        double m2 = dr * dr + di * di;
-        double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
-        // --- analytic base: (1 + (p^2/E) c) / (u - p), c = t(1/2 + t(3/4 +
-        //     15t/8)), t = 1/z^2 = xi^2/(u-p)^2 ---
-        double minv = 1.0 / m2;
-        double ir = dr * minv, ii = -di * minv;    // 1/(u-p)
-        double tr = xi2 * (ir * ir - ii * ii), ti = xi2 * (2.0 * ir * ii);
-        double cr0 = 0.75 + 1.875 * tr, ci0 = 1.875 * ti;
-        double hr0 = 0.5 + (tr * cr0 - ti * ci0), hi0 = tr * ci0 + ti * cr0;
-        double cr = tr * hr0 - ti * hi0, ci = tr * hi0 + ti * hr0;
-        double qr = p2r * invE, qi = p2i * invE;    // p^2 / E
-        double gr = 1.0 + (qr * cr - qi * ci), gi = qr * ci + qi * cr;
-        double bra = gr * ir - gi * ii, bia = gr * ii + gi * ir;
-        // --- zpf8h base: zs = (pr - sqrtE, pi)/xi + (0, 0.9) ---
-        double zr = (pr - sqrtE) * inv_xi;
-        double zi = pi * inv_xi + 0.9;
-        double nr = 0.0, ni = 0.564189504758109, t; // aa8[7]
-        t = nr * zr - ni * zi; ni = nr * zi + ni * zr; nr = t - 0.507771291744591;
-        t = nr * zr - ni * zi; ni = nr * zi + ni * zr - 8.07354660639634; nr = t;
-        t = nr * zr - ni * zi + 6.75847413957232; ni = nr * zi + ni * zr; nr = t;
-        t = nr * zr - ni * zi; ni = nr * zi + ni * zr + 31.490536152863; nr = t;
-        t = nr * zr - ni * zi - 21.9357456686406; ni = nr * zi + ni * zr; nr = t;
-        t = nr * zr - ni * zi; ni = nr * zi + ni * zr - 32.310199761603; nr = t;
-        t = nr * zr - ni * zi + 11.7559071436993; ni = nr * zi + ni * zr; nr = t;
-        double zzr = zr * zr - zi * zi, zzi = 2.0 * zr * zi;
-        double dnr = 1.0, dni = 0.0; // bb8[4]; then bb8[3..0]
-        t = dnr * zzr - dni * zzi - 14.0; dni = dnr * zzi + dni * zzr; dnr = t;
-        t = dnr * zzr - dni * zzi + 52.5; dni = dnr * zzi + dni * zzr; dnr = t;
-        t = dnr * zzr - dni * zzi - 52.5; dni = dnr * zzi + dni * zzr; dnr = t;
-        t = dnr * zzr - dni * zzi + 6.5625; dni = dnr * zzi + dni * zzr; dnr = t;
-        double dm = 1.0 / (dnr * dnr + dni * dni);
-        double wr = (nr * dnr + ni * dni) * dm;
-        double wi = (ni * dnr - nr * dni) * dm;
-        double wgr = -sq * wi, wgi = sq * wr;       // (i sq) w
-        double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
-        double brz = (sqrtE + pr + hr) * invE;
-        double biz = (pi + hi) * invE;
-        // --- branchless select (analytic for |z|>=5, zpf8h otherwise) ---
-        bool far = (m2 >= thr);
-        double br = far ? bra : brz;
-        double bi = far ? bia : biz;
-        sig_s += gs_sr_[i] * br - gs_si_[i] * bi;
-        sig_a += gs_ar_[i] * br - gs_ai_[i] * bi;
-        sig_f += gs_fr_[i] * br - gs_fi_[i] * bi;
+      constexpr int MAXP = 64;
+      double bRa[MAXP], bIa[MAXP], bRz[MAXP], bIz[MAXP], m2v[MAXP];
+      for (int base = ps; base < pe; base += MAXP) {
+        int np = std::min(MAXP, pe - base);
+        // PASS 1: analytic Laurent base
+#pragma omp simd
+        for (int k = 0; k < np; ++k) {
+          double pr = gs_pr_[base + k], pi = gs_pi_[base + k];
+          double dr = sqrtE - pr, di = -pi;
+          double m2 = dr * dr + di * di;
+          m2v[k] = m2;
+          double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
+          double minv = 1.0 / m2;
+          double ir = dr * minv, ii = -di * minv;
+          double tr = xi2 * (ir * ir - ii * ii), ti = xi2 * (2.0 * ir * ii);
+          double cr0 = 0.75 + 1.875 * tr, ci0 = 1.875 * ti;
+          double hr0 = 0.5 + (tr * cr0 - ti * ci0), hi0 = tr * ci0 + ti * cr0;
+          double cr = tr * hr0 - ti * hi0, ci = tr * hi0 + ti * hr0;
+          double qr = p2r * invE, qi = p2i * invE;
+          double gr = 1.0 + (qr * cr - qi * ci), gi = qr * ci + qi * cr;
+          bRa[k] = gr * ir - gi * ii;
+          bIa[k] = gr * ii + gi * ir;
+        }
+        // PASS 2: zpf8h Faddeeva base (zs = (pr-sqrtE, pi)/xi + (0, 0.9))
+#pragma omp simd
+        for (int k = 0; k < np; ++k) {
+          double pr = gs_pr_[base + k], pi = gs_pi_[base + k];
+          double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
+          double zr = (pr - sqrtE) * inv_xi;
+          double zi = pi * inv_xi + 0.9;
+          double nr = 0.0, ni = 0.564189504758109, t;
+          t = nr*zr - ni*zi; ni = nr*zi + ni*zr; nr = t - 0.507771291744591;
+          t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 8.07354660639634; nr = t;
+          t = nr*zr - ni*zi + 6.75847413957232; ni = nr*zi + ni*zr; nr = t;
+          t = nr*zr - ni*zi; ni = nr*zi + ni*zr + 31.490536152863; nr = t;
+          t = nr*zr - ni*zi - 21.9357456686406; ni = nr*zi + ni*zr; nr = t;
+          t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 32.310199761603; nr = t;
+          t = nr*zr - ni*zi + 11.7559071436993; ni = nr*zi + ni*zr; nr = t;
+          double zzr = zr*zr - zi*zi, zzi = 2.0*zr*zi;
+          double dnr = 1.0, dni = 0.0;
+          t = dnr*zzr - dni*zzi - 14.0; dni = dnr*zzi + dni*zzr; dnr = t;
+          t = dnr*zzr - dni*zzi + 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
+          t = dnr*zzr - dni*zzi - 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
+          t = dnr*zzr - dni*zzi + 6.5625; dni = dnr*zzi + dni*zzr; dnr = t;
+          double dm = 1.0 / (dnr*dnr + dni*dni);
+          double wr = (nr*dnr + ni*dni) * dm;
+          double wi = (ni*dnr - nr*dni) * dm;
+          double wgr = -sq * wi, wgi = sq * wr;
+          double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
+          bRz[k] = (sqrtE + pr + hr) * invE;
+          bIz[k] = (pi + hi) * invE;
+        }
+        // PASS 3: arithmetic select (analytic for |z|>=5, else zpf8h)
+#pragma omp simd
+        for (int k = 0; k < np; ++k) {
+          double m = (m2v[k] >= thr) ? 1.0 : 0.0;
+          bRa[k] = bRz[k] + m * (bRa[k] - bRz[k]);
+          bIa[k] = bIz[k] + m * (bIa[k] - bIz[k]);
+        }
+        // PASS 4: residue reduction
+#pragma omp simd reduction(+ : sig_s, sig_a, sig_f)
+        for (int k = 0; k < np; ++k) {
+          sig_s += gs_sr_[base + k] * bRa[k] - gs_si_[base + k] * bIa[k];
+          sig_a += gs_ar_[base + k] * bRa[k] - gs_ai_[base + k] * bIa[k];
+          sig_f += gs_fr_[base + k] * bRa[k] - gs_fi_[base + k] * bIa[k];
+        }
       }
     }
     // 1/v background pole: exact 0K value (broadening-invariant, any T).
