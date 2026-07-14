@@ -720,16 +720,14 @@ void Nuclide::calculate_xs(
                        p.E() <= multipole_->fast_E_max_;
 
     // LAZY GRID INDEXING: a fast-multipole lookup whose transport xs come
-    // entirely from poles needs the ACE grid index only (a) at a collision
-    // (channel-fallback / secondary sampling / tallies) or (b) on THIS
-    // flight lookup if it is in the URR band (calculate_urr_xs adds an ACE
-    // inelastic component). Defer the expensive binary search otherwise --
-    // most flight lookups never collide in this nuclide, so it is pure
-    // saving; ensure_grid_index() recomputes it on demand.
-    bool urr_now = settings::urr_ptables_on && urr_present_ &&
-                   urr_data_[i_temp].energy_in_bounds(p.E());
-    bool lazy_grid =
-      use_fast_mp && !urr_now && !simulation::need_depletion_rx;
+    // entirely from poles needs the ACE grid index only at a collision
+    // (channel-fallback / secondary sampling / tallies). The URR band no
+    // longer forces an eager search -- calculate_urr_xs now takes the smooth
+    // inelastic from the pole other-scatter group (see there), so nothing on
+    // the flight path reads the grid. Defer the binary search: most flight
+    // lookups never collide in this nuclide, so it is pure saving;
+    // ensure_grid_index() recomputes it on demand.
+    bool lazy_grid = use_fast_mp && !simulation::need_depletion_rx;
 
     int i_grid = 0;
     if (lazy_grid) {
@@ -1020,9 +1018,25 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
     }
   }
 
-  // Determine the treatment of inelastic scattering
+  // Determine the treatment of inelastic scattering. When the fast-segment
+  // multipole covers this energy, the pole "other-scatter" group -- total
+  // minus elastic minus absorption, all three still holding the pole values
+  // set by evaluate_fast (the ptable overwrites happen below) -- already IS
+  // the smooth inelastic contribution (in the URR band (n,xn)/MT5 are below
+  // threshold, so other-scatter = MT51..91 = MT4). Taking it from the poles
+  // removes the last ACE energy-grid dependency on the URR flight path, so
+  // the grid index can be deferred to collision (see lazy grid in
+  // calculate_xs). Verified vs NJOY MT4: median 1-3% (fit error on a channel
+  // that is a small fraction of the total). Otherwise read tabulated MT4.
   double inelastic = 0.;
-  if (urr.inelastic_flag_ != C_NONE) {
+  bool pole_inel = multipole_ && multipole_->fast_present_ &&
+                   p.E() > multipole_->E_max_ &&
+                   p.E() <= multipole_->fast_E_max_;
+  if (pole_inel) {
+    inelastic = micro.total - micro.elastic - micro.absorption;
+    if (inelastic < 0.)
+      inelastic = 0.;
+  } else if (urr.inelastic_flag_ != C_NONE) {
     // get interpolation factor
     f = micro.interp_factor;
 
