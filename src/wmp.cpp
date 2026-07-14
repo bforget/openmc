@@ -619,24 +619,24 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         sig_f += gs_fr_[i] * br - gs_fi_[i] * bi;
       }
     } else {
-      // Compute-both + branchless select, LOOP-FISSIONED so each pass is
-      // small enough to auto-vectorize. One big loop did NOT vectorize:
-      // ~40 live doubles/iteration spilled to a temp array ("no vectype")
-      // and the ternary select read as "control flow". Split into four
-      // straight-line passes over small stack temps (windows are <=~47
-      // poles; chunk at MAXP for robustness): (1) analytic Laurent base,
-      // (2) zpf8h Faddeeva base, (3) arithmetic select by |z|^2>=25*xi^2
-      // (== the old if/else split, accuracy 0.04% all nuclides), (4) residue
-      // reduction. Both bases are computed for every pole; vectorization
-      // hides the 2x. The 1/v pole has zeroed SoA residues so pass 4 skips
-      // it; externals stay scalar below.
+      // NEAR/FAR PARTITION -- 1x work AND vectorized (strictly beats
+      // compute-both). The cheap analytic Laurent base is computed for EVERY
+      // pole (vectorizes); the EXPENSIVE zpf8h Faddeeva is done ONLY for the
+      // NEAR poles (|z|^2 < 25*xi^2), which are first COMPACTED into a
+      // contiguous scratch so that loop vectorizes too, then scattered back
+      // over the analytic value. Far poles keep the analytic base (also the
+      // cancellation-safe form they require). This removes the wasted zpf8h
+      // on far poles that made Na-23 (sparse, mostly-far windows) slower.
+      // 1/v pole: zeroed SoA residues -> contributes 0 in the reduction.
       double sq = SQRT_PI * inv_xi;
       double xi2 = xi * xi, thr = 25.0 * xi2;
       constexpr int MAXP = 64;
-      double bRa[MAXP], bIa[MAXP], bRz[MAXP], bIz[MAXP], m2v[MAXP];
+      double bR[MAXP], bI[MAXP], m2v[MAXP];
+      double nPr[MAXP], nPi[MAXP], nbR[MAXP], nbI[MAXP];
+      int nK[MAXP];
       for (int base = ps; base < pe; base += MAXP) {
         int np = std::min(MAXP, pe - base);
-        // PASS 1: analytic Laurent base
+        // PASS 1: analytic Laurent base for ALL poles (vectorizes)
 #pragma omp simd
         for (int k = 0; k < np; ++k) {
           double pr = gs_pr_[base + k], pi = gs_pi_[base + k];
@@ -652,13 +652,24 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
           double cr = tr * hr0 - ti * hi0, ci = tr * hi0 + ti * hr0;
           double qr = p2r * invE, qi = p2i * invE;
           double gr = 1.0 + (qr * cr - qi * ci), gi = qr * ci + qi * cr;
-          bRa[k] = gr * ir - gi * ii;
-          bIa[k] = gr * ii + gi * ir;
+          bR[k] = gr * ir - gi * ii;
+          bI[k] = gr * ii + gi * ir;
         }
-        // PASS 2: zpf8h Faddeeva base (zs = (pr-sqrtE, pi)/xi + (0, 0.9))
-#pragma omp simd
+        // PASS 2: compact the near poles (|z|<5) into contiguous scratch
+        int nn = 0;
         for (int k = 0; k < np; ++k) {
-          double pr = gs_pr_[base + k], pi = gs_pi_[base + k];
+          if (m2v[k] < thr) {
+            nPr[nn] = gs_pr_[base + k];
+            nPi[nn] = gs_pi_[base + k];
+            nK[nn] = k;
+            ++nn;
+          }
+        }
+        // PASS 3: zpf8h Faddeeva base for near poles only (contiguous ->
+        // vectorizes). zs = (pr-sqrtE, pi)/xi + (0, 0.9)
+#pragma omp simd
+        for (int j = 0; j < nn; ++j) {
+          double pr = nPr[j], pi = nPi[j];
           double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
           double zr = (pr - sqrtE) * inv_xi;
           double zi = pi * inv_xi + 0.9;
@@ -681,22 +692,20 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
           double wi = (ni*dnr - nr*dni) * dm;
           double wgr = -sq * wi, wgi = sq * wr;
           double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
-          bRz[k] = (sqrtE + pr + hr) * invE;
-          bIz[k] = (pi + hi) * invE;
+          nbR[j] = (sqrtE + pr + hr) * invE;
+          nbI[j] = (pi + hi) * invE;
         }
-        // PASS 3: arithmetic select (analytic for |z|>=5, else zpf8h)
-#pragma omp simd
-        for (int k = 0; k < np; ++k) {
-          double m = (m2v[k] >= thr) ? 1.0 : 0.0;
-          bRa[k] = bRz[k] + m * (bRa[k] - bRz[k]);
-          bIa[k] = bIz[k] + m * (bIa[k] - bIz[k]);
+        // PASS 4: scatter near results over the analytic base
+        for (int j = 0; j < nn; ++j) {
+          bR[nK[j]] = nbR[j];
+          bI[nK[j]] = nbI[j];
         }
-        // PASS 4: residue reduction
+        // PASS 5: residue reduction (vectorizes)
 #pragma omp simd reduction(+ : sig_s, sig_a, sig_f)
         for (int k = 0; k < np; ++k) {
-          sig_s += gs_sr_[base + k] * bRa[k] - gs_si_[base + k] * bIa[k];
-          sig_a += gs_ar_[base + k] * bRa[k] - gs_ai_[base + k] * bIa[k];
-          sig_f += gs_fr_[base + k] * bRa[k] - gs_fi_[base + k] * bIa[k];
+          sig_s += gs_sr_[base + k] * bR[k] - gs_si_[base + k] * bI[k];
+          sig_a += gs_ar_[base + k] * bR[k] - gs_ai_[base + k] * bI[k];
+          sig_f += gs_fr_[base + k] * bR[k] - gs_fi_[base + k] * bI[k];
         }
       }
     }
