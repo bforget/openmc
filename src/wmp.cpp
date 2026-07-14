@@ -324,6 +324,25 @@ void WindowedMultipole::read_fast_segment(hid_t group)
       fast_cell_first_[i] = w;
     }
   }
+
+  // Real second-order-section flight arrays (SoA) from fw_data_ (see wmp.h).
+  fw_d1_.resize(n_flat);
+  fw_d0_.resize(n_flat);
+  for (int g = 0; g < 4; ++g) {
+    fw_gn1_[g].resize(n_flat);
+    fw_gn0_[g].resize(n_flat);
+  }
+  for (int k = 0; k < n_flat; ++k) {
+    const std::complex<double>* rec = &fw_data_[(size_t)k * FW_STRIDE];
+    double a = rec[0].real(), b = rec[0].imag();
+    fw_d1_[k] = -2.0 * a;
+    fw_d0_[k] = a * a + b * b;
+    for (int g = 0; g < 4; ++g) {
+      double rr = rec[1 + g].real(), ri = rec[1 + g].imag();
+      fw_gn1_[g][k] = rr;
+      fw_gn0_[g][k] = -(rr * a + ri * b);
+    }
+  }
 }
 
 std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
@@ -343,29 +362,35 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   int k1 = fw_off_[w + 1];
   int np = k1 - k0;
 
-  // One reciprocal per pole; accumulate the four collapsed transport sums
-  // from the interleaved per-pole record (one memory stream). The
-  // reciprocal is hand-rolled (conjugate / |d|^2, one real division):
-  // std::complex division goes through the guarded __divc3 path and costs
-  // several times more, and poles never coincide with real sqrtE (Im != 0).
-  // phi is stored only when the window has partially-clamped channels.
+  // Real second-order-section sweep (SoA, plain double -> vectorizes). The
+  // fast range is unbroadened, so sigma = (n1*u + n0)/(u^2 + d1*u + d0)
+  // exactly. phi (for partial-channel clamps) is computed from fw_data_
+  // only when the window has partials (rare).
   constexpr int FAST_MAX_ACTIVE = 96;
   std::complex<double> phi[FAST_MAX_ACTIVE];
   bool need_phi = !fast_partials_[w].empty();
+  double u = sqrtE, uu = sqrtE * sqrtE;
+  const double* d1 = &fw_d1_[k0];
+  const double* d0 = &fw_d0_[k0];
+  const double *ne1 = &fw_gn1_[0][k0], *ne0 = &fw_gn0_[0][k0];
+  const double *nf1 = &fw_gn1_[1][k0], *nf0 = &fw_gn0_[1][k0];
+  const double *nd1 = &fw_gn1_[2][k0], *nd0 = &fw_gn0_[2][k0];
+  const double *no1 = &fw_gn1_[3][k0], *no0 = &fw_gn0_[3][k0];
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
-  const std::complex<double>* rec = &fw_data_[(size_t)k0 * FW_STRIDE];
-  for (int k = 0; k < np; ++k, rec += FW_STRIDE) {
-    double dr = sqrtE - rec[0].real();
-    double di = -rec[0].imag();
-    double inv = 1.0 / (dr * dr + di * di);
-    double pr = dr * inv;
-    double pi = -di * inv;
-    if (need_phi)
-      phi[k] = {pr, pi};
-    el += rec[1].real() * pr - rec[1].imag() * pi;
-    fis += rec[2].real() * pr - rec[2].imag() * pi;
-    dis += rec[3].real() * pr - rec[3].imag() * pi;
-    oth += rec[4].real() * pr - rec[4].imag() * pi;
+  for (int k = 0; k < np; ++k) {
+    double inv = 1.0 / (uu + d1[k] * u + d0[k]);
+    el += (ne1[k] * u + ne0[k]) * inv;
+    fis += (nf1[k] * u + nf0[k]) * inv;
+    dis += (nd1[k] * u + nd0[k]) * inv;
+    oth += (no1[k] * u + no0[k]) * inv;
+  }
+  if (need_phi) {
+    const std::complex<double>* rec = &fw_data_[(size_t)k0 * FW_STRIDE];
+    for (int k = 0; k < np; ++k, rec += FW_STRIDE) {
+      double dr = sqrtE - rec[0].real(), di = -rec[0].imag();
+      double iv = 1.0 / (dr * dr + di * di);
+      phi[k] = {dr * iv, -di * iv};
+    }
   }
 
   // Partially-clamped channels (rare; only near their thresholds)
