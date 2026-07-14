@@ -159,11 +159,15 @@ public:
   // Real second-order-section flight-path arrays (SoA, plain double, so the
   // hot loop vectorizes -- std::complex defeats the auto-vectorizer). The
   // fast range is NOT Doppler-broadened, so sigma = Re[sum r/(sqrtE-p)] is
-  // exact real arithmetic: each pole -> (n1*sqrtE + n0)/(sqrtE^2 + d1*sqrtE
-  // + d0), d1=-2Re(p), d0=|p|^2, n1=Re(r), n0=-(Re(r)Re(p)+Im(r)Im(p)).
+  // exact real arithmetic: each pole -> (n1*u + n0)/((u-alpha)^2 + beta^2),
+  // n1=Re(r), n0=-(Re(r)Re(p)+Im(r)Im(p)). The denominator is stored and
+  // evaluated FACTORED, never expanded to u^2 + d1*u + d0: for a near-real
+  // pole (beta ~ 0) at large u the expanded form cancels catastrophically
+  // (u^2, d1*u, d0 each ~1e6 cancelling to ~1e-11) and can round to exactly
+  // 0.0 -> 1/0 = inf -> NaN total -> "did not sample any nuclide" abort.
   // Built from fw_data_ at load. Groups: 0 elastic, 1 fission,
   // 2 disappearance, 3 other-scatter.
-  vector<double> fw_d1_, fw_d0_;            //!< [n_flat] denominator coeffs
+  vector<double> fw_alpha_, fw_beta2_;      //!< [n_flat] Re(p), Im(p)^2
   vector<double> fw_gn1_[4], fw_gn0_[4];    //!< [n_flat] per-group numerators
   struct FastPartial {
     double E_on;  //!< Clamp: zero below this energy [eV]

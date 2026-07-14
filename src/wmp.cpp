@@ -361,8 +361,10 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   }
 
   // Real second-order-section flight arrays (SoA) from fw_data_ (see wmp.h).
-  fw_d1_.resize(n_flat);
-  fw_d0_.resize(n_flat);
+  // Denominator kept FACTORED (alpha, beta^2) -- see wmp.h for why the
+  // expanded u^2+d1*u+d0 form is catastrophically unstable near real poles.
+  fw_alpha_.resize(n_flat);
+  fw_beta2_.resize(n_flat);
   for (int g = 0; g < 4; ++g) {
     fw_gn1_[g].resize(n_flat);
     fw_gn0_[g].resize(n_flat);
@@ -370,8 +372,8 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   for (int k = 0; k < n_flat; ++k) {
     const std::complex<double>* rec = &fw_data_[(size_t)k * FW_STRIDE];
     double a = rec[0].real(), b = rec[0].imag();
-    fw_d1_[k] = -2.0 * a;
-    fw_d0_[k] = a * a + b * b;
+    fw_alpha_[k] = a;
+    fw_beta2_[k] = b * b;
     for (int g = 0; g < 4; ++g) {
       double rr = rec[1 + g].real(), ri = rec[1 + g].imag();
       fw_gn1_[g][k] = rr;
@@ -398,22 +400,27 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   int np = k1 - k0;
 
   // Real second-order-section sweep (SoA, plain double -> vectorizes). The
-  // fast range is unbroadened, so sigma = (n1*u + n0)/(u^2 + d1*u + d0)
-  // exactly. phi (for partial-channel clamps) is computed from fw_data_
-  // only when the window has partials (rare).
+  // fast range is unbroadened, so sigma = (n1*u + n0)/((u-alpha)^2 + beta^2)
+  // exactly, with the denominator FACTORED (see wmp.h: the expanded form
+  // cancels to 0.0 near real poles -> inf/NaN). phi (for partial-channel
+  // clamps) is computed from fw_data_ only when the window has partials.
   constexpr int FAST_MAX_ACTIVE = 96;
   std::complex<double> phi[FAST_MAX_ACTIVE];
   bool need_phi = !fast_partials_[w].empty();
-  double u = sqrtE, uu = sqrtE * sqrtE;
-  const double* d1 = &fw_d1_[k0];
-  const double* d0 = &fw_d0_[k0];
+  double u = sqrtE;
+  const double* al = &fw_alpha_[k0];
+  const double* be2 = &fw_beta2_[k0];
   const double *ne1 = &fw_gn1_[0][k0], *ne0 = &fw_gn0_[0][k0];
   const double *nf1 = &fw_gn1_[1][k0], *nf0 = &fw_gn0_[1][k0];
   const double *nd1 = &fw_gn1_[2][k0], *nd0 = &fw_gn0_[2][k0];
   const double *no1 = &fw_gn1_[3][k0], *no0 = &fw_gn0_[3][k0];
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
+  // The reduction clause is required for vectorization: without it the four
+  // FP sums are order-dependent and GCC keeps the loop scalar.
+#pragma omp simd reduction(+ : el, fis, dis, oth)
   for (int k = 0; k < np; ++k) {
-    double inv = 1.0 / (uu + d1[k] * u + d0[k]);
+    double du = u - al[k];
+    double inv = 1.0 / (du * du + be2[k]);
     el += (ne1[k] * u + ne0[k]) * inv;
     fis += (nf1[k] * u + nf0[k]) * inv;
     dis += (nd1[k] * u + nd0[k]) * inv;
