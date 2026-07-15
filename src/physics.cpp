@@ -1,5 +1,7 @@
 #include "openmc/physics.h"
 
+#include "openmc/wmp_profile.h"
+
 #include "openmc/bank.h"
 #include "openmc/bremsstrahlung.h"
 #include "openmc/chain.h"
@@ -739,15 +741,19 @@ void scatter(Particle& p, int i_nuclide)
 
     // Fast-segment multipole: select the inelastic level from POLE channel
     // cross sections rather than the tabulated ACE reaction xs. The flight
-    // path already uses the collapsed pole sum; here we evaluate the
-    // individual channels (one set of reciprocals) to pick which one. A
-    // channel not present in the fast fit falls back to the ACE table.
+    // path already uses the collapsed pole sum; here channels are evaluated
+    // SEQUENTIALLY, on demand, as the selection walk reaches them (shared
+    // pole reciprocals computed once by fast_chan_begin) -- pre-evaluating
+    // all channels read the whole ~13 KB residue block when the walk
+    // typically stops after a few. A channel not present in the fast fit
+    // falls back to the ACE table.
     bool fast = nuc->multipole_ && nuc->multipole_->fast_present_ &&
                 p.E() > nuc->multipole_->E_max_ &&
                 p.E() <= nuc->multipole_->fast_E_max_;
-    double chan_xs[256];
+    WindowedMultipole::FastChanCtx chan_ctx;
+    uint64_t prof_tc = wmp_prof_tick();
     if (fast)
-      nuc->multipole_->evaluate_fast_channels(p.E(), chan_xs);
+      nuc->multipole_->fast_chan_begin(p.E(), chan_ctx);
 
     int n = nuc->index_inelastic_scatter_.size();
     int i = 0;
@@ -758,12 +764,15 @@ void scatter(Particle& p, int i_nuclide)
       double rxs;
       if (fast) {
         int c = nuc->multipole_->fast_channel_of_mt(nuc->reactions_[i]->mt_);
-        rxs = (c >= 0) ? chan_xs[c] : nuc->reactions_[i]->xs(micro);
+        rxs = (c >= 0) ? nuc->multipole_->fast_chan_xs(chan_ctx, p.E(), c)
+                       : nuc->reactions_[i]->xs(micro);
       } else {
         rxs = nuc->reactions_[i]->xs(micro);
       }
       prob += rxs;
     }
+    if (fast)
+      wmp_prof_add(WPROF_COLL_CHAN, prof_tc);
 
     // Perform collision physics for inelastic scattering
     const auto& rx {nuc->reactions_[i]};

@@ -6,6 +6,7 @@
 #include "openmc/hdf5_interface.h"
 #include "openmc/math_functions.h"
 #include "openmc/nuclide.h"
+#include "openmc/wmp_profile.h"
 
 #include <fmt/core.h>
 
@@ -300,12 +301,19 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     for (int j = 0; j < n_ext; ++j)
       fw_data_[(size_t)(base + np + j) * FW_STRIDE] = xp(w, j);
 
-    // Per-channel residues (uncollapsed), same flattened pole order
-    for (int c = 0; c < n_mts; ++c) {
-      for (int k = 0; k < np; ++k)
-        fw_chan_res_[(size_t)(base + k) * n_mts + c] = residues(wstart[w] + k, c);
-      for (int j = 0; j < n_ext; ++j)
-        fw_chan_res_[(size_t)(base + np + j) * n_mts + c] = xr(w, j, c);
+    // Per-channel residues (uncollapsed), CHANNEL-MAJOR within the window
+    // block (base*n_mts + c*np_tot + k): the collision walk evaluates one
+    // channel at a time, so each channel's residues must be contiguous.
+    {
+      int np_tot = np + n_ext;
+      size_t wbase = (size_t)base * n_mts;
+      for (int c = 0; c < n_mts; ++c) {
+        for (int k = 0; k < np; ++k)
+          fw_chan_res_[wbase + (size_t)c * np_tot + k] =
+            residues(wstart[w] + k, c);
+        for (int j = 0; j < n_ext; ++j)
+          fw_chan_res_[wbase + (size_t)c * np_tot + np + j] = xr(w, j, c);
+      }
     }
 
     for (int c = 0; c < n_mts; ++c) {
@@ -360,24 +368,25 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     }
   }
 
-  // Real second-order-section flight arrays (SoA) from fw_data_ (see wmp.h).
-  // Denominator kept FACTORED (alpha, beta^2) -- see wmp.h for why the
-  // expanded u^2+d1*u+d0 form is catastrophically unstable near real poles.
-  fw_alpha_.resize(n_flat);
-  fw_beta2_.resize(n_flat);
-  for (int g = 0; g < 4; ++g) {
-    fw_gn1_[g].resize(n_flat);
-    fw_gn0_[g].resize(n_flat);
-  }
-  for (int k = 0; k < n_flat; ++k) {
-    const std::complex<double>* rec = &fw_data_[(size_t)k * FW_STRIDE];
-    double a = rec[0].real(), b = rec[0].imag();
-    fw_alpha_[k] = a;
-    fw_beta2_[k] = b * b;
-    for (int g = 0; g < 4; ++g) {
-      double rr = rec[1 + g].real(), ri = rec[1 + g].imag();
-      fw_gn1_[g][k] = rr;
-      fw_gn0_[g][k] = -(rr * a + ri * b);
+  // Real second-order-section flight arrays from fw_data_ (see wmp.h):
+  // block-interleaved per window, denominator kept FACTORED (alpha, beta^2)
+  // -- the expanded u^2+d1*u+d0 form is catastrophically unstable near real
+  // poles (see wmp.h).
+  fw_soa_.assign((size_t)10 * n_flat, 0.0);
+  for (int w = 0; w < n_win; ++w) {
+    int k0 = fw_off_[w];
+    int np = fw_off_[w + 1] - k0;
+    double* B = &fw_soa_[(size_t)10 * k0];
+    for (int k = 0; k < np; ++k) {
+      const std::complex<double>* rec = &fw_data_[(size_t)(k0 + k) * FW_STRIDE];
+      double a = rec[0].real(), b = rec[0].imag();
+      B[k] = a;
+      B[np + k] = b * b;
+      for (int g = 0; g < 4; ++g) {
+        double rr = rec[1 + g].real(), ri = rec[1 + g].imag();
+        B[(2 + 2 * g) * np + k] = rr;
+        B[(3 + 2 * g) * np + k] = -(rr * a + ri * b);
+      }
     }
   }
 }
@@ -408,12 +417,12 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   std::complex<double> phi[FAST_MAX_ACTIVE];
   bool need_phi = !fast_partials_[w].empty();
   double u = sqrtE;
-  const double* al = &fw_alpha_[k0];
-  const double* be2 = &fw_beta2_[k0];
-  const double *ne1 = &fw_gn1_[0][k0], *ne0 = &fw_gn0_[0][k0];
-  const double *nf1 = &fw_gn1_[1][k0], *nf0 = &fw_gn0_[1][k0];
-  const double *nd1 = &fw_gn1_[2][k0], *nd0 = &fw_gn0_[2][k0];
-  const double *no1 = &fw_gn1_[3][k0], *no0 = &fw_gn0_[3][k0];
+  const double* B = &fw_soa_[(size_t)10 * k0];
+  const double *al = B, *be2 = B + np;
+  const double *ne1 = B + 2 * np, *ne0 = B + 3 * np;
+  const double *nf1 = B + 4 * np, *nf0 = B + 5 * np;
+  const double *nd1 = B + 6 * np, *nd0 = B + 7 * np;
+  const double *no1 = B + 8 * np, *no0 = B + 9 * np;
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
   // The reduction clause is required for vectorization: without it the four
   // FP sums are order-dependent and GCC keeps the loop scalar.
@@ -470,6 +479,7 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
 
 void WindowedMultipole::evaluate_fast_channels(double E, double* out) const
 {
+  uint64_t prof_t0 = wmp_prof_tick();
   double sqrtE = std::sqrt(E);
 
   // O(1) window lookup (same as evaluate_fast)
@@ -497,17 +507,46 @@ void WindowedMultipole::evaluate_fast_channels(double E, double* out) const
     pi_[k] = -di * inv;
   }
 
+  // Channel-major layout: channel c's residues are contiguous
   const std::complex<double>* cr = &fw_chan_res_[(size_t)k0 * nm];
   for (int c = 0; c < nm; ++c) {
     if (E < fast_mt_on_[c] || E > fast_mt_off_[c]) {
       out[c] = 0.0;
       continue;
     }
+    const std::complex<double>* crc = cr + (size_t)c * np;
     double s = 0.0; // Re[r/(u-p)] = r.re*Re(1/d) - r.im*Im(1/d)
     for (int k = 0; k < np; ++k)
-      s += cr[(size_t)k * nm + c].real() * pr_[k] -
-           cr[(size_t)k * nm + c].imag() * pi_[k];
+      s += crc[k].real() * pr_[k] - crc[k].imag() * pi_[k];
     out[c] = (s > 0.0) ? s : 0.0;
+  }
+  wmp_prof_add(WPROF_COLL_CHAN, prof_t0);
+}
+
+void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
+{
+  double sqrtE = std::sqrt(E);
+
+  // O(1) window lookup (same as evaluate_fast)
+  int n_win = fw_off_.size() - 1;
+  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
+  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
+  int w = fast_cell_first_[cell];
+  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
+    ++w;
+
+  ctx.k0 = fw_off_[w];
+  ctx.np = fw_off_[w + 1] - ctx.k0;
+
+  // Shared pole reciprocals, computed once; channels evaluated on demand
+  // by fast_chan_xs() as the selection walk reaches them.
+  const std::complex<double>* rec = &fw_data_[(size_t)ctx.k0 * FW_STRIDE];
+  for (int k = 0; k < ctx.np; ++k, rec += FW_STRIDE) {
+    double dr = sqrtE - rec[0].real();
+    double di = -rec[0].imag();
+    double inv = 1.0 / (dr * dr + di * di);
+    ctx.pr[k] = dr * inv;
+    ctx.pi[k] = -di * inv;
   }
 }
 
@@ -912,6 +951,13 @@ void read_multipole_data(int i_nuclide)
   nuc->multipole_ = make_unique<WindowedMultipole>(group);
   close_group(group);
   file_close(file);
+
+  // Build the O(1) total-nu map for the fast segment's query range (exact,
+  // self-validated; no-op for non-tabulated nu).
+  if (nuc->multipole_->fast_present_) {
+    nuc->init_nu_fast_map(
+      nuc->multipole_->E_max_, nuc->multipole_->fast_E_max_);
+  }
 }
 
 void broaden_wmp_polynomials(double E, double dopp, int n, double factors[])

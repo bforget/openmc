@@ -1,5 +1,9 @@
 #include "openmc/nuclide.h"
 
+#include "openmc/wmp_profile.h"
+
+#include <cstdlib> // for getenv (WMP_FAST_ONLY gate)
+
 #include "openmc/capi.h"
 #include "openmc/container_util.h"
 #include "openmc/cross_sections.h"
@@ -569,6 +573,51 @@ double Nuclide::nu(double E, EmissionMode mode, int group) const
   UNREACHABLE();
 }
 
+void Nuclide::init_nu_fast_map(double e_lo, double e_hi)
+{
+  // Only for tabulated total nu with delayed neutrons on (the case nu(E,
+  // total) actually reads total_nu_); polynomial nu is already cheap.
+  nu_fast_ok_ = false;
+  if (!total_nu_ || !settings::create_delayed_neutrons)
+    return;
+  auto* tab = dynamic_cast<Tabulated1D*>(total_nu_.get());
+  if (!tab)
+    return;
+  nu_fx_ = tab->x();
+  nu_fy_ = tab->y();
+  int npts = nu_fx_.size();
+  if (npts < 2)
+    return;
+  // Uniform-E bracket map over the queried range, ~8 cells per table point.
+  int n_cells = 8 * npts;
+  nu_e0_ = e_lo;
+  nu_inv_de_ = n_cells / (e_hi - e_lo);
+  nu_cell_.resize(n_cells);
+  int j = 0;
+  for (int c = 0; c < n_cells; ++c) {
+    double e_cell = nu_e0_ + c / nu_inv_de_;
+    while (j < npts - 2 && nu_fx_[j + 1] <= e_cell)
+      ++j;
+    nu_cell_[c] = j;
+  }
+  nu_fast_ok_ = true;
+  // SELF-VALIDATION: the map must reproduce the original evaluator exactly
+  // (this also catches non-lin-lin/multi-region tables, whose internals
+  // Tabulated1D does not expose). Any mismatch -> disable, fall back.
+  for (int i = 0; i <= 2000; ++i) {
+    double E = e_lo + (e_hi - e_lo) * i / 2000.0;
+    double a = nu_total_fast(E);
+    double b = (*total_nu_)(E);
+    if (std::abs(a - b) > 1e-12 * std::max(1.0, std::abs(b))) {
+      nu_fast_ok_ = false;
+      nu_fx_.clear();
+      nu_fy_.clear();
+      nu_cell_.clear();
+      return;
+    }
+  }
+}
+
 void Nuclide::calculate_elastic_xs(Particle& p) const
 {
   // Get temperature index, grid index, and interpolation factor
@@ -612,6 +661,10 @@ void Nuclide::calculate_xs(
 {
   auto& micro {p.neutron_xs(index_)};
 
+  // PROFILING (wmp-fast-profile branch): classify + time this lookup.
+  uint64_t prof_t0 = wmp_prof_tick();
+  int prof_cat = WPROF_FLIGHT_ACE;
+
   // Initialize cached cross sections to zero
   micro.elastic = CACHE_INVALID;
   micro.thermal = 0.0;
@@ -622,9 +675,15 @@ void Nuclide::calculate_xs(
   if (multipole_) {
     use_mp = (p.E() >= multipole_->E_min_ && p.E() <= multipole_->E_max_);
   }
+  // WMP_FAST_ONLY=1: force the RESOLVED range onto the tabulated (ACE) path
+  // so only the URR/fast segment uses poles -- isolates fast-range costs.
+  static const bool fast_only = std::getenv("WMP_FAST_ONLY") != nullptr;
+  if (fast_only)
+    use_mp = false;
 
   // Evaluate multipole or interpolate
   if (use_mp) {
+    prof_cat = WPROF_FLIGHT_RES;
     // Call multipole kernel
     double sig_s, sig_a, sig_f;
     std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(p.E(), p.sqrtkT());
@@ -668,6 +727,7 @@ void Nuclide::calculate_xs(
     micro.interp_factor = 0.0;
 
   } else {
+    uint64_t tp = wmp_prof_tick();
     // Find the appropriate temperature index.
     double kT = p.sqrtkT() * p.sqrtkT();
     double f;
@@ -756,6 +816,8 @@ void Nuclide::calculate_xs(
       micro.index_grid = i_grid;
       micro.interp_factor = f;
     }
+    if (use_fast_mp)
+      wmp_prof_add(WPROF_PREAMBLE, tp);
 
     if (!use_fast_mp) {
       // Calculate microscopic nuclide total cross section
@@ -780,9 +842,20 @@ void Nuclide::calculate_xs(
       }
     }
 
-    // Calculate microscopic nuclide photon production cross section
-    micro.photon_prod = (1.0 - f) * xs(i_grid, XS_PHOTON_PROD) +
-                        f * xs(i_grid + 1, XS_PHOTON_PROD);
+    // Calculate microscopic nuclide photon production cross section.
+    // Under lazy grid indexing there is no grid index yet (i_grid=0 and f
+    // UNINITIALIZED -- interpolating here was UB producing garbage
+    // photon_prod on every fast-multipole flight lookup). Zero it instead;
+    // ensure_grid_index() fills the real value at collision time.
+    uint64_t tph = wmp_prof_tick();
+    if (micro.index_grid == C_NONE) {
+      micro.photon_prod = 0.0;
+    } else {
+      micro.photon_prod = (1.0 - f) * xs(i_grid, XS_PHOTON_PROD) +
+                          f * xs(i_grid + 1, XS_PHOTON_PROD);
+    }
+    if (use_fast_mp)
+      wmp_prof_add(WPROF_PHOTON, tph);
 
     // Depletion-related reactions
     if (simulation::need_depletion_rx) {
@@ -830,15 +903,23 @@ void Nuclide::calculate_xs(
     // URR ptables on, calculate_urr_xs multiplies the band factors onto
     // these pole values (see the pole_base gate there).
     if (use_fast_mp) {
+      prof_cat = WPROF_FLIGHT_FAST;
+      uint64_t tk = wmp_prof_tick();
       double sig_t, sig_s, sig_a, sig_f;
       std::tie(sig_t, sig_s, sig_a, sig_f) =
         multipole_->evaluate_fast(p.E());
+      wmp_prof_add(WPROF_KERNEL_FAST, tk);
       micro.total = sig_t;
       micro.elastic = sig_s;
       micro.absorption = sig_a;
       micro.fission = sig_f;
+      uint64_t tn = wmp_prof_tick();
       micro.nu_fission =
-        fissionable_ ? sig_f * this->nu(p.E(), EmissionMode::total) : 0.0;
+        fissionable_
+          ? sig_f * (nu_fast_ok_ ? nu_total_fast(p.E())
+                                 : this->nu(p.E(), EmissionMode::total))
+          : 0.0;
+      wmp_prof_add(WPROF_NU, tn);
     }
   }
 
@@ -859,12 +940,16 @@ void Nuclide::calculate_xs(
   // If the particle is in the unresolved resonance range and there are
   // probability tables, we need to determine cross sections from the table
   if (settings::urr_ptables_on && urr_present_ && !use_mp) {
-    if (urr_data_[micro.index_temp].energy_in_bounds(p.E()))
+    if (urr_data_[micro.index_temp].energy_in_bounds(p.E())) {
+      uint64_t tu = wmp_prof_tick();
       this->calculate_urr_xs(micro.index_temp, p);
+      wmp_prof_add(WPROF_URR, tu);
+    }
   }
 
   micro.last_E = p.E();
   micro.last_sqrtkT = p.sqrtkT();
+  wmp_prof_add(prof_cat, prof_t0);
 }
 
 void Nuclide::ensure_grid_index(Particle& p)
@@ -879,6 +964,7 @@ void Nuclide::ensure_grid_index(Particle& p)
   // range collisions are elastic-only, below any inelastic threshold).
   if (micro.index_grid != C_NONE || micro.index_temp == C_NONE)
     return;
+  uint64_t prof_t0 = wmp_prof_tick();
 
   int i_temp = micro.index_temp;
   const auto& grid {grid_[i_temp]};
@@ -904,6 +990,14 @@ void Nuclide::ensure_grid_index(Particle& p)
   micro.index_grid = i_grid;
   micro.interp_factor = (p.E() - grid.energy[i_grid]) /
                         (grid.energy[i_grid + 1] - grid.energy[i_grid]);
+  // Fill photon_prod (deferred on the lazy flight path, see calculate_xs).
+  {
+    const auto& xs {xs_[i_temp]};
+    double f = micro.interp_factor;
+    micro.photon_prod = (1.0 - f) * xs(i_grid, XS_PHOTON_PROD) +
+                        f * xs(i_grid + 1, XS_PHOTON_PROD);
+  }
+  wmp_prof_add(WPROF_COLL_GRID, prof_t0);
 }
 
 void Nuclide::calculate_sab_xs(int i_sab, double sab_frac, Particle& p)

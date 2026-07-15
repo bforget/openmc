@@ -109,6 +109,35 @@ public:
   // Multipole data
   unique_ptr<WindowedMultipole> multipole_;
 
+  // O(1) total-nu lookup for the fast-multipole flight path. ACE carries
+  // nu*sigma_f pre-multiplied on the grid, but the pole path must evaluate
+  // nu(E) itself -- a per-lookup Tabulated1D binary search (~100+ cycles).
+  // This uniform-E bracket map over the tabulated (lin-lin) nu makes it
+  // O(1) and EXACT (self-validated against the original evaluator at init;
+  // disabled on any mismatch, falling back to nu()).
+  //! Build the map over [e_lo, e_hi] (the fast segment's query range).
+  void init_nu_fast_map(double e_lo, double e_hi);
+  //! Exact O(1) tabulated total-nu; only call when nu_fast_ok_.
+  double nu_total_fast(double E) const
+  {
+    int c = (int)((E - nu_e0_) * nu_inv_de_);
+    if (c < 0)
+      c = 0;
+    int cmax = (int)nu_cell_.size() - 1;
+    if (c > cmax)
+      c = cmax;
+    int j = nu_cell_[c];
+    int jmax = (int)nu_fx_.size() - 2;
+    while (j < jmax && E >= nu_fx_[j + 1])
+      ++j;
+    double f = (E - nu_fx_[j]) / (nu_fx_[j + 1] - nu_fx_[j]);
+    return nu_fy_[j] + f * (nu_fy_[j + 1] - nu_fy_[j]);
+  }
+  bool nu_fast_ok_ {false};
+  vector<double> nu_fx_, nu_fy_; //!< tabulated nu (x ascending, lin-lin)
+  vector<int> nu_cell_;          //!< uniform-E cell -> bracketing index
+  double nu_e0_ {0.0}, nu_inv_de_ {0.0};
+
   // Fission data
   bool fissionable_ {false};         //!< Whether nuclide is fissionable
   bool has_partial_fission_ {false}; //!< has partial fission reactions?

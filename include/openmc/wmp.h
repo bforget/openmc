@@ -97,6 +97,32 @@ public:
   //! \param out Output buffer, size >= fast_n_mts_
   void evaluate_fast_channels(double E, double* out) const;
 
+  //! Sequential per-channel evaluation for collision channel selection:
+  //! scatter() walks channels accumulating probability until the sampled
+  //! cutoff is crossed, so pre-evaluating ALL channels (the full n_mts x np
+  //! residue block, ~13 KB for U-235) wastes most of the work. begin()
+  //! computes the shared pole reciprocals once; channel_xs() then evaluates
+  //! ONE channel on demand (contiguous np-length dot product in the
+  //! channel-major residue layout).
+  struct FastChanCtx {
+    int k0;          //!< first flattened pole of the window
+    int np;          //!< number of active poles
+    double pr[96];   //!< Re of pole reciprocals 1/(u - p)
+    double pi[96];   //!< Im of pole reciprocals
+  };
+  void fast_chan_begin(double E, FastChanCtx& ctx) const;
+  double fast_chan_xs(const FastChanCtx& ctx, double E, int c) const
+  {
+    if (E < fast_mt_on_[c] || E > fast_mt_off_[c])
+      return 0.0;
+    const std::complex<double>* cr =
+      &fw_chan_res_[(size_t)ctx.k0 * fast_n_mts_ + (size_t)c * ctx.np];
+    double s = 0.0;
+    for (int k = 0; k < ctx.np; ++k)
+      s += cr[k].real() * ctx.pr[k] - cr[k].imag() * ctx.pi[k];
+    return (s > 0.0) ? s : 0.0;
+  }
+
   //! Channel index for a given MT in the fast segment, or -1 if not fit.
   int fast_channel_of_mt(int mt) const
   {
@@ -167,7 +193,13 @@ public:
   // 0.0 -> 1/0 = inf -> NaN total -> "did not sample any nuclide" abort.
   // Built from fw_data_ at load. Groups: 0 elastic, 1 fission,
   // 2 disappearance, 3 other-scatter.
-  vector<double> fw_alpha_, fw_beta2_;      //!< [n_flat] Re(p), Im(p)^2
+  // BLOCK-INTERLEAVED single array: window w's record starts at 10*fw_off_[w]
+  // with layout [alpha(np) | beta2(np) | n1_el(np) | n0_el(np) | n1_fis |
+  // n0_fis | n1_dis | n0_dis | n1_oth | n0_oth] -- ONE contiguous stream per
+  // lookup (a 10-separate-vectors SoA made every lookup touch 10 scattered
+  // regions; transport jumps windows randomly so all 10 were cache-cold).
+  // Each sub-array is still unit-stride, so the sweep still vectorizes.
+  vector<double> fw_soa_; //!< [10 * n_flat] per-window interleaved blocks
   vector<double> fw_gn1_[4], fw_gn0_[4];    //!< [n_flat] per-group numerators
   struct FastPartial {
     double E_on;  //!< Clamp: zero below this energy [eV]
