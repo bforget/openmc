@@ -991,7 +991,11 @@ void Nuclide::ensure_grid_index(Particle& p)
   micro.interp_factor = (p.E() - grid.energy[i_grid]) /
                         (grid.energy[i_grid + 1] - grid.energy[i_grid]);
   // Fill photon_prod (deferred on the lazy flight path, see calculate_xs).
-  {
+  // Its ONLY consumer is sample_secondary_photons, which runs solely under
+  // photon transport -- in neutron-only mode the value is never read, so
+  // skip the interpolation entirely (Ben 2026-07-14; revisit when moving
+  // beyond neutron-only).
+  if (settings::photon_transport) {
     const auto& xs {xs_[i_temp]};
     double f = micro.interp_factor;
     micro.photon_prod = (1.0 - f) * xs(i_grid, XS_PHOTON_PROD) +
