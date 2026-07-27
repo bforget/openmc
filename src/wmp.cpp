@@ -11,9 +11,100 @@
 #include <fmt/core.h>
 
 #include <algorithm> // for min
+#include <array>
 #include <cmath>
+#include <complex>
+#include <vector>
 
 namespace openmc {
+
+namespace {
+
+//! Gauss-Legendre nodes/weights on [-1, 1] via Newton iteration on P_n.
+void leggauss(int n, std::vector<double>& x, std::vector<double>& w)
+{
+  x.resize(n);
+  w.resize(n);
+  for (int i = 0; i < (n + 1) / 2; ++i) {
+    double z = std::cos(PI * (i + 0.75) / (n + 0.5));
+    double z1, pp;
+    do {
+      double p1 = 1.0, p2 = 0.0;
+      for (int j = 0; j < n; ++j) {
+        double p3 = p2;
+        p2 = p1;
+        p1 = ((2.0 * j + 1.0) * z * p2 - j * p3) / (j + 1.0);
+      }
+      pp = n * (z * p1 - p2) / (z * z - 1.0);
+      z1 = z;
+      z = z1 - p1 / pp;
+    } while (std::abs(z - z1) > 1e-14);
+    x[i] = -z;
+    x[n - 1 - i] = z;
+    double ww = 2.0 / ((1.0 - z * z) * pp * pp);
+    w[i] = ww;
+    w[n - 1 - i] = ww;
+  }
+}
+
+//! Composite Gauss-Legendre abscissae/weights on (0, hi) with refined pockets
+//! (16-64 pts) around any narrow in-range pole and a 12-pt base elsewhere.
+//! Ports evalxs.lowe_nodes exactly (used only below the low-E floor).
+void lowe_nodes(double hi, const std::vector<std::complex<double>>& Pc,
+  std::vector<double>& ug, std::vector<double>& wg)
+{
+  const int n_base = 12;
+  std::vector<std::array<double, 3>> cuts; // {lo, hi, beta}
+  for (const auto& p : Pc) {
+    double a = p.real(), b = p.imag();
+    if (b < hi / 4.0 && -8.0 * b < a && a < hi + 8.0 * b) {
+      double lo = std::max(a - 8.0 * b, 0.0), hp = std::min(a + 8.0 * b, hi);
+      if (hp > lo)
+        cuts.push_back({lo, hp, b});
+    }
+  }
+  std::sort(cuts.begin(), cuts.end(),
+    [](const std::array<double, 3>& A, const std::array<double, 3>& B) {
+      return A[0] < B[0];
+    });
+  std::vector<std::array<double, 3>> merged;
+  for (const auto& c : cuts) {
+    if (!merged.empty() && c[0] <= merged.back()[1]) {
+      merged.back()[1] = std::max(merged.back()[1], c[1]);
+      merged.back()[2] = std::min(merged.back()[2], c[2]);
+    } else {
+      merged.push_back(c);
+    }
+  }
+  struct Seg {
+    double lo, hi;
+    int n;
+  };
+  std::vector<Seg> segs;
+  double prev = 0.0;
+  for (const auto& m : merged) {
+    if (m[0] > prev)
+      segs.push_back({prev, m[0], n_base});
+    double nf = std::min(std::max(4.0 * (m[1] - m[0]) / m[2], 16.0), 64.0);
+    segs.push_back({m[0], m[1], static_cast<int>(nf)});
+    prev = m[1];
+  }
+  if (prev < hi)
+    segs.push_back({prev, hi, n_base});
+  ug.clear();
+  wg.clear();
+  std::vector<double> X, W;
+  for (const auto& s : segs) {
+    leggauss(s.n, X, W);
+    double c0 = 0.5 * (s.hi - s.lo), c1 = 0.5 * (s.hi + s.lo);
+    for (int i = 0; i < s.n; ++i) {
+      ug.push_back(c0 * X[i] + c1);
+      wg.push_back(c0 * W[i]);
+    }
+  }
+}
+
+} // namespace
 
 //========================================================================
 // WindowedeMultipole implementation
@@ -550,6 +641,67 @@ void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
   }
 }
 
+std::tuple<double, double, double> WindowedMultipole::lowe_correction(
+  double sqrtE, double xi, int i_window) const
+{
+  // Gather this window's non-1/v poles (pool + externals) with their
+  // per-channel residues. The 1/v pole (Re p == 0) is excluded: it is
+  // broadening-invariant and already exact (its pool SoA residues are
+  // zeroed and its contribution added separately).
+  std::vector<std::complex<double>> Pc, Rs, Ra, Rf;
+  int ps = win_start_[i_window], pe = win_end_[i_window];
+  Pc.reserve(pe - ps + ext_data_.shape(1));
+  Rs.reserve(Pc.capacity());
+  Ra.reserve(Pc.capacity());
+  Rf.reserve(Pc.capacity());
+  for (int i = ps; i < pe; ++i) {
+    if (std::abs(gs_pr_[i]) < 1e-12)
+      continue; // 1/v pole
+    Pc.emplace_back(gs_pr_[i], gs_pi_[i]);
+    Rs.emplace_back(gs_sr_[i], gs_si_[i]);
+    Ra.emplace_back(gs_ar_[i], gs_ai_[i]);
+    Rf.emplace_back(gs_fr_[i], gs_fi_[i]);
+  }
+  int n_ext = ext_data_.shape(1);
+  for (int j = 0; j < n_ext; ++j) {
+    const std::complex<double>* rec = &ext_data_(i_window, j, 0);
+    if (std::abs(rec[0].real()) < 1e-12)
+      continue;
+    Pc.push_back(rec[0]);
+    Rs.push_back(rec[1]);
+    Ra.push_back(rec[2]);
+    Rf.push_back(rec[3]);
+  }
+  if (Pc.empty())
+    return std::make_tuple(0.0, 0.0, 0.0);
+
+  // Composite Gauss-Legendre over (0, u + 5*xi); integrand carries the image
+  // kernel exp(-((u'+u)/xi)^2) times the even part of u'^2 * sigma(u').
+  std::vector<double> ug, wg;
+  lowe_nodes(sqrtE + 5.0 * xi, Pc, ug, wg);
+
+  double cs = 0.0, ca = 0.0, cf = 0.0;
+  for (std::size_t g = 0; g < ug.size(); ++g) {
+    double up = ug[g];
+    double kp = std::exp(-((up + sqrtE) / xi) * ((up + sqrtE) / xi));
+    double sk = 0.0, ak = 0.0, fk = 0.0;
+    for (std::size_t m = 0; m < Pc.size(); ++m) {
+      // phi = 1/(u'-p) + 1/(-u'-p): the even part of the pole basis
+      std::complex<double> ph =
+        1.0 / (up - Pc[m]) + 1.0 / (-up - Pc[m]);
+      sk += (Rs[m] * ph).real();
+      ak += (Ra[m] * ph).real();
+      fk += (Rf[m] * ph).real();
+    }
+    double wk = wg[g] * kp * up * up;
+    cs += wk * sk;
+    ca += wk * ak;
+    cf += wk * fk;
+  }
+  double norm = 1.0 / (xi * SQRT_PI * sqrtE * sqrtE);
+  return std::make_tuple(cs * norm, ca * norm, cf * norm);
+}
+
 std::tuple<double, double, double> WindowedMultipole::evaluate(
   double E, double sqrtkT) const
 {
@@ -768,6 +920,18 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     // ~5 to >100 across E, genuinely needing the analytic/Faddeeva split.
     for (int j = 0; j < n_ext; ++j) {
       accumulate(&ext_data_(i_window, j, 0));
+    }
+
+    // Low-E free-gas image-kernel correction: the one-kernel form above
+    // neglects the exp(-((u'+u)/xi)^2) image kernel below u < 4.5*xi. For
+    // light nuclides (H1: floor ~0.5 eV) this spans the thermal range and is
+    // essential for a correct moderator (scattering) cross section.
+    if (xi > 0.0 && sqrtE < 4.5 * xi) {
+      double cs, ca, cf;
+      std::tie(cs, ca, cf) = lowe_correction(sqrtE, xi, i_window);
+      sig_s -= cs;
+      sig_a -= ca;
+      sig_f -= cf;
     }
     return std::make_tuple(sig_s, sig_a, sig_f);
   }

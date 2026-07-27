@@ -65,6 +65,20 @@ public:
   //! sections in [b]
   std::tuple<double, double, double> evaluate(double E, double sqrtkT) const;
 
+  //! \brief Low-energy free-gas image-kernel correction (subtractive).
+  //!
+  //! The one-kernel analytic Doppler form (full-line Faddeeva) neglects the
+  //! free-gas image kernel exp(-((u'+u)/xi)^2) and the u'=0 truncation of the
+  //! (0,inf) integral. This is negligible for u >= 4.5*xi but grows below it;
+  //! for light nuclides (AWR~1, e.g. H1) that floor reaches ~0.5 eV, spanning
+  //! the whole thermal range and corrupting the (scattering) cross section.
+  //! Returns the per-channel (elastic, absorption, fission) corrections to be
+  //! SUBTRACTED from the one-kernel result. Composite Gauss-Legendre with
+  //! pockets around any narrow in-range poles (ports evalxs.lowe_corr).
+  //! \param sqrtE sqrt(E) in sqrt(eV); \param xi sqrt(kT/AWR); i_window index
+  std::tuple<double, double, double> lowe_correction(
+    double sqrtE, double xi, int i_window) const;
+
   //! \brief Evaluates the windowed multipole equations for the derivative of
   //! cross sections in the resolved resonance regions with respect to
   //! temperature.
