@@ -20,6 +20,22 @@ namespace openmc {
 
 namespace {
 
+// 12-point Gauss-Legendre nodes/weights on [-1, 1] (the base panel of the
+// low-E correction, used on the hot path with no narrow in-range poles;
+// precomputed so leggauss/Newton is never run there).
+constexpr int N_GL12 {12};
+const double GL12_X[N_GL12] = {-9.81560634246719244e-01,
+  -9.04117256370474798e-01, -7.69902674194304693e-01,
+  -5.87317954286617483e-01, -3.67831498998180184e-01,
+  -1.25233408511468913e-01, 1.25233408511468913e-01, 3.67831498998180184e-01,
+  5.87317954286617483e-01, 7.69902674194304693e-01, 9.04117256370474798e-01,
+  9.81560634246719244e-01};
+const double GL12_W[N_GL12] = {4.71753363865120220e-02, 1.06939325995318885e-01,
+  1.60078328543346110e-01, 2.03167426723065647e-01, 2.33492536538354639e-01,
+  2.49147045813402690e-01, 2.49147045813402690e-01, 2.33492536538354639e-01,
+  2.03167426723065647e-01, 1.60078328543346110e-01, 1.06939325995318885e-01,
+  4.71753363865120220e-02};
+
 //! Gauss-Legendre nodes/weights on [-1, 1] via Newton iteration on P_n.
 void leggauss(int n, std::vector<double>& x, std::vector<double>& w)
 {
@@ -49,14 +65,17 @@ void leggauss(int n, std::vector<double>& x, std::vector<double>& w)
 
 //! Composite Gauss-Legendre abscissae/weights on (0, hi) with refined pockets
 //! (16-64 pts) around any narrow in-range pole and a 12-pt base elsewhere.
-//! Ports evalxs.lowe_nodes exactly (used only below the low-E floor).
-void lowe_nodes(double hi, const std::vector<std::complex<double>>& Pc,
+//! Ports evalxs.lowe_nodes exactly. RARE path only: reached solely when a
+//! window has a narrow in-range background pole (e.g. Na-23); the common case
+//! (no narrow pole -> a single GL-12 panel) is handled inline in
+//! lowe_correction without touching this function.
+void lowe_nodes(double hi, const std::complex<double>* Pc, int nP,
   std::vector<double>& ug, std::vector<double>& wg)
 {
   const int n_base = 12;
   std::vector<std::array<double, 3>> cuts; // {lo, hi, beta}
-  for (const auto& p : Pc) {
-    double a = p.real(), b = p.imag();
+  for (int ip = 0; ip < nP; ++ip) {
+    double a = Pc[ip].real(), b = Pc[ip].imag();
     if (b < hi / 4.0 && -8.0 * b < a && a < hi + 8.0 * b) {
       double lo = std::max(a - 8.0 * b, 0.0), hp = std::min(a + 8.0 * b, hi);
       if (hp > lo)
@@ -645,58 +664,87 @@ std::tuple<double, double, double> WindowedMultipole::lowe_correction(
   double sqrtE, double xi, int i_window) const
 {
   // Gather this window's non-1/v poles (pool + externals) with their
-  // per-channel residues. The 1/v pole (Re p == 0) is excluded: it is
-  // broadening-invariant and already exact (its pool SoA residues are
-  // zeroed and its contribution added separately).
-  std::vector<std::complex<double>> Pc, Rs, Ra, Rf;
+  // per-channel residues into fixed stack buffers as struct-of-arrays doubles
+  // (no heap, and the inner loop is hand-rolled/vectorizable -- std::complex
+  // division/multiply route through guarded libcalls, far too slow for a path
+  // that fires on nearly every thermal lookup for light nuclides). The 1/v
+  // pole (Re p == 0) is excluded: it is broadening-invariant and already
+  // exact (its pool SoA residues are zeroed and it is added separately).
+  constexpr int MAXP = 256;
+  double Ppr[MAXP], Ppi[MAXP];
+  double Rsr[MAXP], Rsi[MAXP], Rar[MAXP], Rai[MAXP], Rfr[MAXP], Rfi[MAXP];
+  int n = 0;
+  double hi = sqrtE + 5.0 * xi;
+  bool narrow = false; // any pole triggers a refined pocket in lowe_nodes?
+  auto take = [&](double a, double b, std::complex<double> rs,
+                std::complex<double> ra, std::complex<double> rf) {
+    if (std::abs(a) < 1e-12 || n >= MAXP)
+      return; // 1/v pole (or overflow guard)
+    Ppr[n] = a;
+    Ppi[n] = b;
+    Rsr[n] = rs.real();
+    Rsi[n] = rs.imag();
+    Rar[n] = ra.real();
+    Rai[n] = ra.imag();
+    Rfr[n] = rf.real();
+    Rfi[n] = rf.imag();
+    if (b < hi * 0.25 && -8.0 * b < a && a < hi + 8.0 * b)
+      narrow = true;
+    ++n;
+  };
   int ps = win_start_[i_window], pe = win_end_[i_window];
-  Pc.reserve(pe - ps + ext_data_.shape(1));
-  Rs.reserve(Pc.capacity());
-  Ra.reserve(Pc.capacity());
-  Rf.reserve(Pc.capacity());
-  for (int i = ps; i < pe; ++i) {
-    if (std::abs(gs_pr_[i]) < 1e-12)
-      continue; // 1/v pole
-    Pc.emplace_back(gs_pr_[i], gs_pi_[i]);
-    Rs.emplace_back(gs_sr_[i], gs_si_[i]);
-    Ra.emplace_back(gs_ar_[i], gs_ai_[i]);
-    Rf.emplace_back(gs_fr_[i], gs_fi_[i]);
-  }
+  for (int i = ps; i < pe; ++i)
+    take(gs_pr_[i], gs_pi_[i], {gs_sr_[i], gs_si_[i]}, {gs_ar_[i], gs_ai_[i]},
+      {gs_fr_[i], gs_fi_[i]});
   int n_ext = ext_data_.shape(1);
   for (int j = 0; j < n_ext; ++j) {
     const std::complex<double>* rec = &ext_data_(i_window, j, 0);
-    if (std::abs(rec[0].real()) < 1e-12)
-      continue;
-    Pc.push_back(rec[0]);
-    Rs.push_back(rec[1]);
-    Ra.push_back(rec[2]);
-    Rf.push_back(rec[3]);
+    take(rec[0].real(), rec[0].imag(), rec[1], rec[2], rec[3]);
   }
-  if (Pc.empty())
+  if (n == 0)
     return std::make_tuple(0.0, 0.0, 0.0);
 
-  // Composite Gauss-Legendre over (0, u + 5*xi); integrand carries the image
-  // kernel exp(-((u'+u)/xi)^2) times the even part of u'^2 * sigma(u').
-  std::vector<double> ug, wg;
-  lowe_nodes(sqrtE + 5.0 * xi, Pc, ug, wg);
-
+  // Quadrature of the image-kernel integral: exp(-((u'+u)/xi)^2) times the
+  // even part of u'^2 * sigma(u') over (0, u + 5*xi). One GL node contributes
+  // (hand-rolled: 1/(u'-p) has real part (u'-pr)/den, imag part pi/den):
   double cs = 0.0, ca = 0.0, cf = 0.0;
-  for (std::size_t g = 0; g < ug.size(); ++g) {
-    double up = ug[g];
+  auto add_node = [&](double up, double wgt) {
     double kp = std::exp(-((up + sqrtE) / xi) * ((up + sqrtE) / xi));
     double sk = 0.0, ak = 0.0, fk = 0.0;
-    for (std::size_t m = 0; m < Pc.size(); ++m) {
-      // phi = 1/(u'-p) + 1/(-u'-p): the even part of the pole basis
-      std::complex<double> ph =
-        1.0 / (up - Pc[m]) + 1.0 / (-up - Pc[m]);
-      sk += (Rs[m] * ph).real();
-      ak += (Ra[m] * ph).real();
-      fk += (Rf[m] * ph).real();
+#pragma omp simd reduction(+ : sk, ak, fk)
+    for (int m = 0; m < n; ++m) {
+      double pr = Ppr[m], pi = Ppi[m];
+      double d1 = up - pr, d2 = -up - pr;
+      double inv1 = 1.0 / (d1 * d1 + pi * pi);
+      double inv2 = 1.0 / (d2 * d2 + pi * pi);
+      double phr = d1 * inv1 + d2 * inv2; // Re[1/(u'-p) + 1/(-u'-p)]
+      double phi = pi * (inv1 + inv2);    // Im of the same
+      sk += Rsr[m] * phr - Rsi[m] * phi;
+      ak += Rar[m] * phr - Rai[m] * phi;
+      fk += Rfr[m] * phr - Rfi[m] * phi;
     }
-    double wk = wg[g] * kp * up * up;
+    double wk = wgt * kp * up * up;
     cs += wk * sk;
     ca += wk * ak;
     cf += wk * fk;
+  };
+
+  if (!narrow) {
+    // HOT PATH (H1/O16/actinides): a single GL-12 panel over (0, hi) from the
+    // static table -- no heap, no Newton. Bit-identical to lowe_nodes here,
+    // which returns exactly this when no pole is narrow enough for a pocket.
+    double c = 0.5 * hi;
+    for (int k = 0; k < N_GL12; ++k)
+      add_node(c * (GL12_X[k] + 1.0), c * GL12_W[k]);
+  } else {
+    // RARE PATH: composite pockets around narrow background pole(s).
+    std::complex<double> Pc[MAXP];
+    for (int m = 0; m < n; ++m)
+      Pc[m] = {Ppr[m], Ppi[m]};
+    std::vector<double> ug, wg;
+    lowe_nodes(hi, Pc, n, ug, wg);
+    for (std::size_t g = 0; g < ug.size(); ++g)
+      add_node(ug[g], wg[g]);
   }
   double norm = 1.0 / (xi * SQRT_PI * sqrtE * sqrtE);
   return std::make_tuple(cs * norm, ca * norm, cf * norm);
