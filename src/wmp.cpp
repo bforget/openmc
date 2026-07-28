@@ -971,10 +971,17 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     }
 
     // Low-E free-gas image-kernel correction: the one-kernel form above
-    // neglects the exp(-((u'+u)/xi)^2) image kernel below u < 4.5*xi. For
-    // light nuclides (H1: floor ~0.5 eV) this spans the thermal range and is
-    // essential for a correct moderator (scattering) cross section.
-    if (xi > 0.0 && sqrtE < 4.5 * xi) {
+    // neglects the exp(-((u'+u)/xi)^2) image kernel below u < LOWE_THR*xi. For
+    // light nuclides (H1) this spans the thermal range and is essential for a
+    // correct moderator (scattering) cross section. Both the correction AND
+    // the one-kernel error decay as exp(-(u/xi)^2), so the firing threshold is
+    // a SIGNIFICANCE bound, not just a form-validity bound: measured H1/O16
+    // elastic error vs ACE is unchanged from 4.5 down to 2.5, while 4.5 makes
+    // abundant mid-mass nuclides (O16 at u/xi~4 at the thermal peak) pay the
+    // quadrature for a ~1e-7 correction. 3.5 keeps the correction wherever it
+    // matters (<=5e-6 relative skipped) and stops O16 firing at thermal.
+    constexpr double LOWE_THR = 3.5;
+    if (xi > 0.0 && sqrtE < LOWE_THR * xi) {
       double cs, ca, cf;
       std::tie(cs, ca, cf) = lowe_correction(sqrtE, xi, i_window);
       sig_s -= cs;
