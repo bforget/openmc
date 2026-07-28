@@ -324,6 +324,37 @@ void WindowedMultipole::read_global_segment(hid_t group)
         if (onev_window_ >= 0) break;
       }
     }
+
+    // Optional low-E polynomial segment (see wmp.h). curvefit shape is
+    // [n_poly, order+1, n_ch]; collapse the per-MT channels to the transport
+    // triplet exactly as the residues are collapsed above.
+    if (object_exists(group, "poly_curvefit")) {
+      poly_present_ = true;
+      read_dataset(group, "poly_E_max", poly_E_max_);
+      read_dataset(group, "poly_sqrtE_bounds", poly_sqrtE_bounds_);
+      if (attribute_exists(group, "poly_order"))
+        read_attribute(group, "poly_order", poly_order_);
+      tensor::Tensor<double> cf; // [n_poly, order+1, n_ch]
+      read_dataset(group, "poly_curvefit", cf);
+      int n_poly = cf.shape(0), no = cf.shape(1), nch = cf.shape(2);
+      poly_order_ = no - 1;
+      poly_s_.resize(n_poly * no);
+      poly_a_.resize(n_poly * no);
+      poly_f_.resize(n_poly * no);
+      for (int w = 0; w < n_poly; ++w) {
+        for (int k = 0; k < no; ++k) {
+          int idx = w * no + k;
+          poly_s_[idx] = cf(w, k, 0);
+          if (nch == 3) {
+            poly_a_[idx] = cf(w, k, 1) + cf(w, k, 2); // MT18 + MT102
+            poly_f_[idx] = cf(w, k, 1);               // MT18
+          } else {
+            poly_a_[idx] = cf(w, k, 1);               // MT102
+            poly_f_[idx] = 0.0;
+          }
+        }
+      }
+    }
 }
 
 void WindowedMultipole::read_fast_segment(hid_t group)
@@ -767,6 +798,36 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
   // range + external poles, sigma-basis analytic broadening.
 
   if (global_format_) {
+    // Low-E polynomial segment: below poly_E_max_ the smooth cross section is a
+    // windowed curvefit broadened EXACTLY (image kernel included) -- cheap, and
+    // no G-L correction. Replaces poles+externals here.
+    if (poly_present_ && E < poly_E_max_) {
+      int n_poly = poly_sqrtE_bounds_.size() - 1;
+      int w = std::upper_bound(poly_sqrtE_bounds_.begin(),
+                poly_sqrtE_bounds_.end(), sqrtE) -
+              poly_sqrtE_bounds_.begin() - 1;
+      w = std::min(std::max(w, 0), n_poly - 1);
+      int no = poly_order_ + 1;
+      array<double, MAX_POLY_COEFFICIENTS> fac;
+      if (sqrtkT > 0.0) {
+        double dopp = sqrt_awr_ / sqrtkT;
+        broaden_wmp_polynomials(E, dopp, no, fac.data());
+      } else {
+        double t = invE; // 0K basis E^(i/2-1): 1/E, 1/sqrtE, 1, sqrtE, ...
+        for (int k = 0; k < no; ++k) { fac[k] = t; t *= sqrtE; }
+      }
+      double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
+      const double* cs = &poly_s_[w * no];
+      const double* ca = &poly_a_[w * no];
+      const double* cf = &poly_f_[w * no];
+      for (int k = 0; k < no; ++k) {
+        sig_s += cs[k] * fac[k];
+        sig_a += ca[k] * fac[k];
+        sig_f += cf[k] * fac[k];
+      }
+      return std::make_tuple(sig_s, sig_a, sig_f);
+    }
+
     // Variable-width windows: O(1) two-level index (uniform coarse grid in
     // sqrt(E) + short forward walk; see wmp.h)
     int n_win = win_start_.size();

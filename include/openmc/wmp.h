@@ -265,6 +265,18 @@ public:
   int onev_window_ {-1};                          //!< its owning window
   std::complex<double> onev_p_, onev_rs_, onev_ra_, onev_rf_; //!< its data
 
+  // Low-E polynomial segment (optional): below poly_E_max_ the cross section is
+  // a windowed low-order curvefit in the classic-WMP power-law basis
+  // (E^(i/2-1)), broadened EXACTLY by broaden_wmp_polynomials (which contains
+  // the free-gas image kernel). Replaces poles+externals+G-L in the smooth
+  // sub-resonance region: cheap Doppler, no image-kernel approximation.
+  bool poly_present_ {false};
+  double poly_E_max_ {0.0};                        //!< cutoff; below -> curvefit
+  int poly_order_ {0};                             //!< curvefit order
+  vector<double> poly_sqrtE_bounds_;               //!< [n_poly+1]
+  // collapsed transport coefficients, flat [n_poly*(order+1)] per channel:
+  vector<double> poly_s_, poly_a_, poly_f_;        //!< scatter/absorption/fission
+
   // Constant data
   static constexpr int MAX_POLY_COEFFICIENTS =
     11; //!< Max order of polynomial fit plus one
