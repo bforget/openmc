@@ -144,9 +144,10 @@ WindowedMultipole::WindowedMultipole(hid_t group)
     return;
   }
 
-  // Global-pole format (AAA-fit libraries): detected by the presence of
-  // the external-pole dataset. See wmp.h for the format description.
-  if (object_exists(group, "ext_poles")) {
+  // Global-pole format (AAA-fit libraries): detected by the window pointer
+  // arrays, which are unique to it (the OLD format also has a "curvefit"
+  // dataset, so that name cannot be the discriminator). See wmp.h.
+  if (object_exists(group, "win_pole_start")) {
     read_global_segment(group);
     return;
   }
@@ -268,26 +269,33 @@ void WindowedMultipole::read_global_segment(hid_t group)
       }
     }
 
-    tensor::Tensor<std::complex<double>> xp;  // (n_win, 4)
-    tensor::Tensor<std::complex<double>> xr;  // (n_win, 4, 3)
-    read_dataset(group, "ext_poles", xp);
-    read_dataset(group, "ext_residues", xr);
-    int n_ext = xp.shape(1);
-    ext_data_ =
-      tensor::Tensor<std::complex<double>>({(size_t)n_win, (size_t)n_ext, 4});
-    for (int i = 0; i < n_win; ++i) {
-      for (int j = 0; j < n_ext; ++j) {
-        ext_data_(i, j, MP_EA) = xp(i, j);
-        if (fissionable_) {
-          ext_data_(i, j, MP_RS) = xr(i, j, 0);
-          ext_data_(i, j, MP_RA) = xr(i, j, 1) + xr(i, j, 2);
-          ext_data_(i, j, MP_RF) = xr(i, j, 1);
-        } else {
-          ext_data_(i, j, MP_RS) = xr(i, j, 0);
-          ext_data_(i, j, MP_RA) = xr(i, j, 1);
-          ext_data_(i, j, MP_RF) = 0.0;
+    // External background poles are OPTIONAL: current libraries carry a
+    // per-window curvefit instead (read below). Older global-format files
+    // still have them, so both are supported.
+    if (object_exists(group, "ext_poles")) {
+      tensor::Tensor<std::complex<double>> xp;  // (n_win, 4)
+      tensor::Tensor<std::complex<double>> xr;  // (n_win, 4, 3)
+      read_dataset(group, "ext_poles", xp);
+      read_dataset(group, "ext_residues", xr);
+      int n_ext = xp.shape(1);
+      ext_data_ =
+        tensor::Tensor<std::complex<double>>({(size_t)n_win, (size_t)n_ext, 4});
+      for (int i = 0; i < n_win; ++i) {
+        for (int j = 0; j < n_ext; ++j) {
+          ext_data_(i, j, MP_EA) = xp(i, j);
+          if (fissionable_) {
+            ext_data_(i, j, MP_RS) = xr(i, j, 0);
+            ext_data_(i, j, MP_RA) = xr(i, j, 1) + xr(i, j, 2);
+            ext_data_(i, j, MP_RF) = xr(i, j, 1);
+          } else {
+            ext_data_(i, j, MP_RS) = xr(i, j, 0);
+            ext_data_(i, j, MP_RA) = xr(i, j, 1);
+            ext_data_(i, j, MP_RF) = 0.0;
+          }
         }
       }
+    } else {
+      ext_data_ = tensor::Tensor<std::complex<double>>({(size_t)n_win, 0, 4});
     }
 
     // Build the branch-free SoA pool arrays (see wmp.h). The 1/v pole
@@ -317,40 +325,33 @@ void WindowedMultipole::read_global_segment(hid_t group)
       }
     }
     if (onev_present_) {
-      for (int w = 0; w < n_win; ++w) {
-        for (int i = win_start_[w]; i < win_end_[w]; ++i) {
-          if (gs_pr_[i] == 0.0) { onev_window_ = w; break; }
-        }
-        if (onev_window_ >= 0) break;
+      for (int i = 0; i < n_pool; ++i) {
+        if (gs_pr_[i] == 0.0) { onev_idx_ = i; break; }
       }
     }
 
-    // Optional low-E polynomial segment (see wmp.h). curvefit shape is
-    // [n_poly, order+1, n_ch]; collapse the per-MT channels to the transport
-    // triplet exactly as the residues are collapsed above.
-    if (object_exists(group, "poly_curvefit")) {
-      poly_present_ = true;
-      read_dataset(group, "poly_E_max", poly_E_max_);
-      read_dataset(group, "poly_sqrtE_bounds", poly_sqrtE_bounds_);
-      if (attribute_exists(group, "poly_order"))
-        read_attribute(group, "poly_order", poly_order_);
-      tensor::Tensor<double> cf; // [n_poly, order+1, n_ch]
-      read_dataset(group, "poly_curvefit", cf);
-      int n_poly = cf.shape(0), no = cf.shape(1), nch = cf.shape(2);
-      poly_order_ = no - 1;
-      poly_s_.resize(n_poly * no);
-      poly_a_.resize(n_poly * no);
-      poly_f_.resize(n_poly * no);
-      for (int w = 0; w < n_poly; ++w) {
-        for (int k = 0; k < no; ++k) {
-          int idx = w * no + k;
-          poly_s_[idx] = cf(w, k, 0);
+    // Per-window smooth-background CURVEFIT (see wmp.h): ADDED to the pole
+    // sum. curvefit shape [n_win, n_cf, n_ch]; collapse the per-MT channels
+    // to the transport triplet exactly as the residues are collapsed above.
+    if (object_exists(group, "curvefit")) {
+      cf_present_ = true;
+      tensor::Tensor<double> cf; // [n_win, n_cf, n_ch]
+      read_dataset(group, "curvefit", cf);
+      int n_cw = cf.shape(0), nc = cf.shape(1), nch = cf.shape(2);
+      cf_n_ = nc;
+      cf_s_.resize((size_t)n_cw * nc);
+      cf_a_.resize((size_t)n_cw * nc);
+      cf_f_.resize((size_t)n_cw * nc);
+      for (int w = 0; w < n_cw; ++w) {
+        for (int k = 0; k < nc; ++k) {
+          size_t idx = (size_t)w * nc + k;
+          cf_s_[idx] = cf(w, k, 0);
           if (nch == 3) {
-            poly_a_[idx] = cf(w, k, 1) + cf(w, k, 2); // MT18 + MT102
-            poly_f_[idx] = cf(w, k, 1);               // MT18
+            cf_a_[idx] = cf(w, k, 1) + cf(w, k, 2); // MT18 + MT102
+            cf_f_[idx] = cf(w, k, 1);               // MT18
           } else {
-            poly_a_[idx] = cf(w, k, 1);               // MT102
-            poly_f_[idx] = 0.0;
+            cf_a_[idx] = cf(w, k, 1);               // MT102
+            cf_f_[idx] = 0.0;
           }
         }
       }
@@ -798,36 +799,6 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
   // range + external poles, sigma-basis analytic broadening.
 
   if (global_format_) {
-    // Low-E polynomial segment: below poly_E_max_ the smooth cross section is a
-    // windowed curvefit broadened EXACTLY (image kernel included) -- cheap, and
-    // no G-L correction. Replaces poles+externals here.
-    if (poly_present_ && E < poly_E_max_) {
-      int n_poly = poly_sqrtE_bounds_.size() - 1;
-      int w = std::upper_bound(poly_sqrtE_bounds_.begin(),
-                poly_sqrtE_bounds_.end(), sqrtE) -
-              poly_sqrtE_bounds_.begin() - 1;
-      w = std::min(std::max(w, 0), n_poly - 1);
-      int no = poly_order_ + 1;
-      array<double, MAX_POLY_COEFFICIENTS> fac;
-      if (sqrtkT > 0.0) {
-        double dopp = sqrt_awr_ / sqrtkT;
-        broaden_wmp_polynomials(E, dopp, no, fac.data());
-      } else {
-        double t = invE; // 0K basis E^(i/2-1): 1/E, 1/sqrtE, 1, sqrtE, ...
-        for (int k = 0; k < no; ++k) { fac[k] = t; t *= sqrtE; }
-      }
-      double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
-      const double* cs = &poly_s_[w * no];
-      const double* ca = &poly_a_[w * no];
-      const double* cf = &poly_f_[w * no];
-      for (int k = 0; k < no; ++k) {
-        sig_s += cs[k] * fac[k];
-        sig_a += ca[k] * fac[k];
-        sig_f += cf[k] * fac[k];
-      }
-      return std::make_tuple(sig_s, sig_a, sig_f);
-    }
-
     // Variable-width windows: O(1) two-level index (uniform coarse grid in
     // sqrt(E) + short forward walk; see wmp.h)
     int n_win = win_start_.size();
@@ -1017,7 +988,10 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       }
     }
     // 1/v background pole: exact 0K value (broadening-invariant, any T).
-    if (onev_present_ && i_window == onev_window_) {
+    // Tested against THIS window's pointer range -- several windows can point
+    // at it, and each of them owes its 1/v contribution.
+    if (onev_present_ && onev_idx_ >= win_start_[i_window]
+        && onev_idx_ < win_end_[i_window]) {
       double dr = sqrtE - onev_p_.real(), di = -onev_p_.imag();
       double minv = 1.0 / (dr * dr + di * di);
       double br = dr * minv, bi = -di * minv;
@@ -1029,6 +1003,29 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     // ~5 to >100 across E, genuinely needing the analytic/Faddeeva split.
     for (int j = 0; j < n_ext; ++j) {
       accumulate(&ext_data_(i_window, j, 0));
+    }
+
+    // Per-window smooth-background CURVEFIT, ADDED to the pole sum (the
+    // original WMP decomposition; see wmp.h). Broadened by
+    // broaden_wmp_polynomials, which is the EXACT free-gas broadening of the
+    // E^(i/2-1) basis (image kernel included) -- so this part needs no low-E
+    // correction, and it replaces the 4 external Faddeeva calls per window.
+    if (cf_present_) {
+      array<double, MAX_POLY_COEFFICIENTS> fac;
+      if (sqrtkT > 0.0) {
+        broaden_wmp_polynomials(E, sqrt_awr_ / sqrtkT, cf_n_, fac.data());
+      } else {
+        double t = invE; // 0K basis: 1/E, 1/sqrtE, 1, sqrtE, ...
+        for (int k = 0; k < cf_n_; ++k) { fac[k] = t; t *= sqrtE; }
+      }
+      const double* cs = &cf_s_[(size_t)i_window * cf_n_];
+      const double* ca = &cf_a_[(size_t)i_window * cf_n_];
+      const double* cf = &cf_f_[(size_t)i_window * cf_n_];
+      for (int k = 0; k < cf_n_; ++k) {
+        sig_s += cs[k] * fac[k];
+        sig_a += ca[k] * fac[k];
+        sig_f += cf[k] * fac[k];
+      }
     }
 
     // Low-E free-gas image-kernel correction: the one-kernel form above

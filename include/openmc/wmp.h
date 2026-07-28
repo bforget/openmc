@@ -45,6 +45,7 @@ public:
   };
 
   // Constructors, destructors
+  WindowedMultipole() = default;
   WindowedMultipole(hid_t group);
 
   //! Read a global-pole-format segment (poles/residues/windows/externals)
@@ -262,20 +263,23 @@ public:
   vector<double> gs_ar_, gs_ai_;                  //!< [n_pool] absorption residue
   vector<double> gs_fr_, gs_fi_;                  //!< [n_pool] fission residue
   bool onev_present_ {false};                     //!< 1/v background pole?
-  int onev_window_ {-1};                          //!< its owning window
+  int onev_idx_ {-1};                             //!< its POOL INDEX. The 1/v
+  // pole can lie inside the pointer range of SEVERAL windows, so membership
+  // must be tested per lookup: caching a single "owning window" silently
+  // dropped its contribution (and halved 1/v absorption) in every other
+  // window that pointed at it.
   std::complex<double> onev_p_, onev_rs_, onev_ra_, onev_rf_; //!< its data
 
-  // Low-E polynomial segment (optional): below poly_E_max_ the cross section is
-  // a windowed low-order curvefit in the classic-WMP power-law basis
-  // (E^(i/2-1)), broadened EXACTLY by broaden_wmp_polynomials (which contains
-  // the free-gas image kernel). Replaces poles+externals+G-L in the smooth
-  // sub-resonance region: cheap Doppler, no image-kernel approximation.
-  bool poly_present_ {false};
-  double poly_E_max_ {0.0};                        //!< cutoff; below -> curvefit
-  int poly_order_ {0};                             //!< curvefit order
-  vector<double> poly_sqrtE_bounds_;               //!< [n_poly+1]
-  // collapsed transport coefficients, flat [n_poly*(order+1)] per channel:
-  vector<double> poly_s_, poly_a_, poly_f_;        //!< scatter/absorption/fission
+  // Per-window smooth-background CURVEFIT (global format): every window adds
+  // sum_i c_i E^(i/2-1) to its pole sum -- the original WMP decomposition.
+  // Replaces the 4 external poles that used to carry the background: same job
+  // for ~5 real terms instead of 4 Faddeeva calls, and broaden_wmp_polynomials
+  // is the EXACT free-gas broadening of this basis (image kernel included),
+  // so the smooth part of sigma needs no low-E correction at all.
+  bool cf_present_ {false};
+  int cf_n_ {0};                                   //!< terms (order+1)
+  // collapsed transport coefficients, flat [n_win * cf_n_] per channel:
+  vector<double> cf_s_, cf_a_, cf_f_;              //!< scatter/absorption/fission
 
   // Constant data
   static constexpr int MAX_POLY_COEFFICIENTS =
