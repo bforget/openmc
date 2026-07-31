@@ -11,15 +11,12 @@ std::mutex reg_mutex;
 std::vector<WmpProfCounters*> registry;
 } // namespace
 
-WmpProfCounters& wmp_prof_local()
+thread_local WmpProfCounters wmp_prof_tls;
+
+void wmp_prof_register(WmpProfCounters* c)
 {
-  static thread_local WmpProfCounters* local = [] {
-    auto* c = new WmpProfCounters();
-    std::lock_guard<std::mutex> lock(reg_mutex);
-    registry.push_back(c);
-    return c;
-  }();
-  return *local;
+  std::lock_guard<std::mutex> lock(reg_mutex);
+  registry.push_back(c);
 }
 
 void wmp_prof_report()
@@ -53,6 +50,11 @@ void wmp_prof_report()
     "collision evaluate_fast_channels",
     "  flight preamble (temp+lazy)  [subset]",
     "  flight photon_prod interp    [subset]",
+    "  flight head  (micro init)    [subset]",
+    "  flight tail  (sab/urr/cache) [subset]",
+    "    urr search (bsearch+prn)   [subset]",
+    "    urr band interpolation     [subset]",
+    "    urr nu() (2nd, slow path)  [subset]",
   };
   std::printf("\n ===== WMP fast-range cycle attribution (rdtsc) =====\n");
   std::printf(" %-38s %14s %12s %10s\n", "category", "calls", "Mcycles",
