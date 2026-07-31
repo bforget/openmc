@@ -1,3 +1,8 @@
+#include <cstring>
+#include <string>
+
+#include <x86intrin.h>
+
 #include "openmc/wmp.h"
 
 #include "openmc/constants.h"
@@ -14,116 +19,10 @@
 #include <array>
 #include <cmath>
 #include <complex>
-#include <vector>
 
 namespace openmc {
 
-namespace {
 
-// 12-point Gauss-Legendre nodes/weights on [-1, 1] (the base panel of the
-// low-E correction, used on the hot path with no narrow in-range poles;
-// precomputed so leggauss/Newton is never run there).
-constexpr int N_GL12 {12};
-const double GL12_X[N_GL12] = {-9.81560634246719244e-01,
-  -9.04117256370474798e-01, -7.69902674194304693e-01,
-  -5.87317954286617483e-01, -3.67831498998180184e-01,
-  -1.25233408511468913e-01, 1.25233408511468913e-01, 3.67831498998180184e-01,
-  5.87317954286617483e-01, 7.69902674194304693e-01, 9.04117256370474798e-01,
-  9.81560634246719244e-01};
-const double GL12_W[N_GL12] = {4.71753363865120220e-02, 1.06939325995318885e-01,
-  1.60078328543346110e-01, 2.03167426723065647e-01, 2.33492536538354639e-01,
-  2.49147045813402690e-01, 2.49147045813402690e-01, 2.33492536538354639e-01,
-  2.03167426723065647e-01, 1.60078328543346110e-01, 1.06939325995318885e-01,
-  4.71753363865120220e-02};
-
-//! Gauss-Legendre nodes/weights on [-1, 1] via Newton iteration on P_n.
-void leggauss(int n, std::vector<double>& x, std::vector<double>& w)
-{
-  x.resize(n);
-  w.resize(n);
-  for (int i = 0; i < (n + 1) / 2; ++i) {
-    double z = std::cos(PI * (i + 0.75) / (n + 0.5));
-    double z1, pp;
-    do {
-      double p1 = 1.0, p2 = 0.0;
-      for (int j = 0; j < n; ++j) {
-        double p3 = p2;
-        p2 = p1;
-        p1 = ((2.0 * j + 1.0) * z * p2 - j * p3) / (j + 1.0);
-      }
-      pp = n * (z * p1 - p2) / (z * z - 1.0);
-      z1 = z;
-      z = z1 - p1 / pp;
-    } while (std::abs(z - z1) > 1e-14);
-    x[i] = -z;
-    x[n - 1 - i] = z;
-    double ww = 2.0 / ((1.0 - z * z) * pp * pp);
-    w[i] = ww;
-    w[n - 1 - i] = ww;
-  }
-}
-
-//! Composite Gauss-Legendre abscissae/weights on (0, hi) with refined pockets
-//! (16-64 pts) around any narrow in-range pole and a 12-pt base elsewhere.
-//! Ports evalxs.lowe_nodes exactly. RARE path only: reached solely when a
-//! window has a narrow in-range background pole (e.g. Na-23); the common case
-//! (no narrow pole -> a single GL-12 panel) is handled inline in
-//! lowe_correction without touching this function.
-void lowe_nodes(double hi, const std::complex<double>* Pc, int nP,
-  std::vector<double>& ug, std::vector<double>& wg)
-{
-  const int n_base = 12;
-  std::vector<std::array<double, 3>> cuts; // {lo, hi, beta}
-  for (int ip = 0; ip < nP; ++ip) {
-    double a = Pc[ip].real(), b = Pc[ip].imag();
-    if (b < hi / 4.0 && -8.0 * b < a && a < hi + 8.0 * b) {
-      double lo = std::max(a - 8.0 * b, 0.0), hp = std::min(a + 8.0 * b, hi);
-      if (hp > lo)
-        cuts.push_back({lo, hp, b});
-    }
-  }
-  std::sort(cuts.begin(), cuts.end(),
-    [](const std::array<double, 3>& A, const std::array<double, 3>& B) {
-      return A[0] < B[0];
-    });
-  std::vector<std::array<double, 3>> merged;
-  for (const auto& c : cuts) {
-    if (!merged.empty() && c[0] <= merged.back()[1]) {
-      merged.back()[1] = std::max(merged.back()[1], c[1]);
-      merged.back()[2] = std::min(merged.back()[2], c[2]);
-    } else {
-      merged.push_back(c);
-    }
-  }
-  struct Seg {
-    double lo, hi;
-    int n;
-  };
-  std::vector<Seg> segs;
-  double prev = 0.0;
-  for (const auto& m : merged) {
-    if (m[0] > prev)
-      segs.push_back({prev, m[0], n_base});
-    double nf = std::min(std::max(4.0 * (m[1] - m[0]) / m[2], 16.0), 64.0);
-    segs.push_back({m[0], m[1], static_cast<int>(nf)});
-    prev = m[1];
-  }
-  if (prev < hi)
-    segs.push_back({prev, hi, n_base});
-  ug.clear();
-  wg.clear();
-  std::vector<double> X, W;
-  for (const auto& s : segs) {
-    leggauss(s.n, X, W);
-    double c0 = 0.5 * (s.hi - s.lo), c1 = 0.5 * (s.hi + s.lo);
-    for (int i = 0; i < s.n; ++i) {
-      ug.push_back(c0 * X[i] + c1);
-      wg.push_back(c0 * W[i]);
-    }
-  }
-}
-
-} // namespace
 
 //========================================================================
 // WindowedeMultipole implementation
@@ -253,6 +152,20 @@ void WindowedMultipole::read_global_segment(hid_t group)
     read_dataset(group, "sqrtE_bounds", bounds);
     sqrtE_bounds_.assign(bounds.begin(), bounds.end());
 
+    // Grid convention (optional attributes; absent in older libraries).
+    if (attribute_exists(group, "grid_uniform")) {
+      int gu = 0;
+      double ul = 0.0, sp = 0.0;
+      read_attribute(group, "grid_uniform", gu);
+      read_attribute(group, "grid_u_lowe", ul);
+      read_attribute(group, "grid_spacing", sp);
+      if (gu == 1 && sp > 0.0) {
+        grid_uniform_ = true;
+        grid_u_lowe_ = ul;
+        grid_inv_spacing_ = 1.0 / sp;
+      }
+    }
+
     // Build the two-level O(1) window index (see wmp.h)
     {
       int n_cells = 4 * n_win;
@@ -302,31 +215,29 @@ void WindowedMultipole::read_global_segment(hid_t group)
     // (Re p == 0) is broadening-invariant and must NOT go through zpf8h:
     // zero its SoA residues so the vector loop skips it, and stash its data
     // + owning window for a separate exact-0K add.
-    gs_pr_.resize(n_pool); gs_pi_.resize(n_pool);
-    gs_sr_.resize(n_pool); gs_si_.resize(n_pool);
-    gs_ar_.resize(n_pool); gs_ai_.resize(n_pool);
-    gs_fr_.resize(n_pool); gs_fi_.resize(n_pool);
+    gs_stride_ = fissionable_ ? 8 : 6;   // drop the all-zero fission residue
+    cf_ch_ = fissionable_ ? 3 : 2;
+    gs_aos_.assign((size_t)n_pool * gs_stride_, 0.0);
     for (int i = 0; i < n_pool; ++i) {
+      double* r = &gs_aos_[(size_t)i * gs_stride_];
       std::complex<double> p = gdata_(i, MP_EA);
-      gs_pr_[i] = p.real(); gs_pi_[i] = p.imag();
-      bool is1v = (p.real() == 0.0);
-      if (is1v) {
+      r[0] = p.real(); r[1] = p.imag();
+      if (p.real() == 0.0) {
+        // 1/v pole: residues stay ZERO so the vector loop adds nothing for
+        // it; its exact 0K contribution is added separately per window.
         onev_present_ = true;
         onev_p_ = p;
         onev_rs_ = gdata_(i, MP_RS);
         onev_ra_ = gdata_(i, MP_RA);
         onev_rf_ = gdata_(i, MP_RF);
-        gs_sr_[i] = gs_si_[i] = gs_ar_[i] = gs_ai_[i] = 0.0;
-        gs_fr_[i] = gs_fi_[i] = 0.0;
+        if (onev_idx_ < 0)
+          onev_idx_ = i;   // FIRST such pole, matching the old second pass
       } else {
-        gs_sr_[i] = gdata_(i, MP_RS).real(); gs_si_[i] = gdata_(i, MP_RS).imag();
-        gs_ar_[i] = gdata_(i, MP_RA).real(); gs_ai_[i] = gdata_(i, MP_RA).imag();
-        gs_fr_[i] = gdata_(i, MP_RF).real(); gs_fi_[i] = gdata_(i, MP_RF).imag();
-      }
-    }
-    if (onev_present_) {
-      for (int i = 0; i < n_pool; ++i) {
-        if (gs_pr_[i] == 0.0) { onev_idx_ = i; break; }
+        r[2] = gdata_(i, MP_RS).real(); r[3] = gdata_(i, MP_RS).imag();
+        r[4] = gdata_(i, MP_RA).real(); r[5] = gdata_(i, MP_RA).imag();
+        if (fissionable_) {
+          r[6] = gdata_(i, MP_RF).real(); r[7] = gdata_(i, MP_RF).imag();
+        }
       }
     }
 
@@ -339,22 +250,78 @@ void WindowedMultipole::read_global_segment(hid_t group)
       read_dataset(group, "curvefit", cf);
       int n_cw = cf.shape(0), nc = cf.shape(1), nch = cf.shape(2);
       cf_n_ = nc;
-      cf_s_.resize((size_t)n_cw * nc);
-      cf_a_.resize((size_t)n_cw * nc);
-      cf_f_.resize((size_t)n_cw * nc);
+      // INTERLEAVED per window: [s0,a0,f0, s1,a1,f1, ...]. Three separate
+      // flat arrays meant three scattered lines per lookup; one window's
+      // block is 3*cf_n_ doubles (120 B at cf_n_=5) = 2 lines, prefetched.
+      cf_blk_.assign((size_t)n_cw * nc * cf_ch_, 0.0);
       for (int w = 0; w < n_cw; ++w) {
         for (int k = 0; k < nc; ++k) {
-          size_t idx = (size_t)w * nc + k;
-          cf_s_[idx] = cf(w, k, 0);
+          double* d = &cf_blk_[((size_t)w * nc + k) * cf_ch_];
+          d[0] = cf(w, k, 0);
           if (nch == 3) {
-            cf_a_[idx] = cf(w, k, 1) + cf(w, k, 2); // MT18 + MT102
-            cf_f_[idx] = cf(w, k, 1);               // MT18
+            d[1] = cf(w, k, 1) + cf(w, k, 2); // MT18 + MT102
+            d[2] = cf(w, k, 1);               // MT18 (fissionable only)
           } else {
-            cf_a_[idx] = cf(w, k, 1);               // MT102
-            cf_f_[idx] = 0.0;
+            d[1] = cf(w, k, 1);               // MT102
           }
         }
       }
+    }
+
+    // ---- materialise the PER-WINDOW CONTIGUOUS BLOCKS (see wmp.h) ----
+    // Everything one lookup touches, laid out in the order it is read. Built
+    // once here; the hot path then does a single offset and a sequential run.
+    {
+      int n_win = win_start_.size();
+      int ncf3 = cf_present_ ? cf_n_ * cf_ch_ : 0;
+      win_.resize(n_win);
+      win_u_lo_ = sqrtE_bounds_.front();
+      // 64-BYTE ALIGN every block. Packed flat, a block landing at an
+      // arbitrary offset STRADDLES an extra cache line -- a 96 B block spans
+      // three lines instead of two whenever it is not line-aligned, which for
+      // uniformly distributed offsets is most of the time. Static line budget
+      // over the 32-nuclide library: 4.06 -> 3.56 lines per lookup (-12%).
+      // Costs only the padding rounded up to the next 8 doubles per window.
+      constexpr size_t DPL = 64 / sizeof(double);   // doubles per cache line
+      vector<size_t> sz(n_win);
+      size_t total = 0;
+      for (int w = 0; w < n_win; ++w) {
+        int np = win_end_[w] - win_start_[w];
+        if (np < 0)
+          np = 0;                       // empty pointer range is legal
+        win_[w].u_hi = sqrtE_bounds_[w + 1];
+        win_[w].np = (uint16_t)np;
+        win_[w].flags = 0;
+        if (onev_present_ && onev_idx_ >= win_start_[w]
+            && onev_idx_ < win_end_[w])
+          win_[w].flags |= WIN_HAS_ONEV;
+        sz[w] = ((size_t)ncf3 + (size_t)np * gs_stride_ + DPL - 1)
+                / DPL * DPL;            // round up to a whole line
+        total += sz[w];
+      }
+      // std::vector guarantees only 16-B alignment, so over-allocate one line
+      // and start the first block at the next 64-B boundary.
+      blk_.assign(total + DPL, 0.0);
+      size_t pad = ((64 - (reinterpret_cast<uintptr_t>(blk_.data()) & 63)) & 63)
+                   / sizeof(double);
+      size_t off = pad;
+      for (int w = 0; w < n_win; ++w) {
+        win_[w].blk_off = (uint32_t)off;
+        off += sz[w];
+      }
+      for (int w = 0; w < n_win; ++w) {
+        double* b = &blk_[win_[w].blk_off];
+        if (ncf3) {
+          const double* c = &cf_blk_[(size_t)w * ncf3];
+          std::copy(c, c + ncf3, b);
+          b += ncf3;
+        }
+        const double* src = &gs_aos_[(size_t)win_start_[w] * gs_stride_];
+        std::copy(src, src + (size_t)win_[w].np * gs_stride_, b);
+      }
+      // the source arrays are now redundant on the hot path
+      vector<double>().swap(gs_aos_);
+      vector<double>().swap(cf_blk_);
     }
 }
 
@@ -514,29 +481,400 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   // block-interleaved per window, denominator kept FACTORED (alpha, beta^2)
   // -- the expanded u^2+d1*u+d0 form is catastrophically unstable near real
   // poles (see wmp.h).
-  fw_soa_.assign((size_t)10 * n_flat, 0.0);
+  // CHANNEL SPECIALISATION. The sweep reserves two numerator slots for each of
+  // the four collapsed channels (elastic, fission, disappearance=capture,
+  // other), so a pole always cost 10 doubles. Most nuclides do not use all
+  // four -- H-1 in the fast range is elastic + capture only -- and packing
+  // just the channels a nuclide actually uses removes those bytes at zero
+  // accuracy cost, with no refit and no change to the pole count. Unlike the
+  // resolved range's failed byte reductions this does not disturb the access
+  // pattern: same SoA sweep, fewer streams.
+  //
+  // Note `dis` is CAPTURE (kind 2), which nearly every nuclide has -- do not
+  // confuse it with an unused channel. Every one of the eight combinations is
+  // instantiated below; a fall-through reads the wrong slots and segfaults
+  // downstream in Nuclide::calculate_xs, not here.
+  fast_has_fis_ = fast_has_dis_ = fast_has_oth_ = false;
+  for (size_t i = 0; i < (size_t)n_flat; ++i) {
+    const std::complex<double>* rec = &fw_data_[i * FW_STRIDE];
+    if (rec[2] != 0.0) fast_has_fis_ = true;
+    if (rec[3] != 0.0) fast_has_dis_ = true;
+    if (rec[4] != 0.0) fast_has_oth_ = true;
+  }
+  const int nch = 1 + (int)fast_has_fis_ + (int)fast_has_dis_
+                    + (int)fast_has_oth_;
+  fast_soa_stride_ = 2 + 2 * nch;
+  if (std::getenv("WMP_FASTCH_DEBUG"))
+    std::fprintf(stderr, "[fastch] %-8s el%s%s%s -> stride %d/10 (%.0f%% of bytes)\n",
+      name_.c_str(), fast_has_fis_ ? "+fis" : "", fast_has_dis_ ? "+dis" : "",
+      fast_has_oth_ ? "+oth" : "", fast_soa_stride_, 100.0 * fast_soa_stride_ / 10.0);
+  fw_soa_.assign((size_t)fast_soa_stride_ * n_flat, 0.0);
   for (int w = 0; w < n_win; ++w) {
     int k0 = fw_off_[w];
     int np = fw_off_[w + 1] - k0;
-    double* B = &fw_soa_[(size_t)10 * k0];
+    double* B = &fw_soa_[(size_t)fast_soa_stride_ * k0];
     for (int k = 0; k < np; ++k) {
       const std::complex<double>* rec = &fw_data_[(size_t)(k0 + k) * FW_STRIDE];
       double a = rec[0].real(), b = rec[0].imag();
       B[k] = a;
       B[np + k] = b * b;
+      int slot = 0;
       for (int g = 0; g < 4; ++g) {
+        if ((g == 1 && !fast_has_fis_) || (g == 2 && !fast_has_dis_)
+            || (g == 3 && !fast_has_oth_))
+          continue;
         double rr = rec[1 + g].real(), ri = rec[1 + g].imag();
-        B[(2 + 2 * g) * np + k] = rr;
-        B[(3 + 2 * g) * np + k] = -(rr * a + ri * b);
+        B[(2 + 2 * slot) * np + k] = rr;
+        B[(3 + 2 * slot) * np + k] = -(rr * a + ri * b);
+        ++slot;
       }
     }
   }
+
+  // ---- rewindowed FLIGHT path (optional; see wmp.h FlWin) ----------------
+  // Libraries without the flight_* datasets keep the full-pole sweep above.
+  if (object_exists(group, "flight_bounds")) {
+    tensor::Tensor<double> flb, flcf;
+    tensor::Tensor<int64_t> fls, fle, fli;
+    read_dataset(group, "flight_bounds", flb);
+    read_dataset(group, "flight_win_start", fls);
+    read_dataset(group, "flight_win_end", fle);
+    read_dataset(group, "flight_pole_idx", fli);
+    read_dataset(group, "flight_curvefit", flcf);
+    tensor::Tensor<double> slo, shi;
+    tensor::Tensor<int64_t> sw0, snw;
+    read_dataset(group, "flight_seg_lo", slo);
+    read_dataset(group, "flight_seg_hi", shi);
+    read_dataset(group, "flight_seg_win0", sw0);
+    read_dataset(group, "flight_seg_nwin", snw);
+
+    int n_sub = fls.shape(0);
+    fl_order_ = flcf.shape(1);
+    fl_bounds_.assign(flb.begin(), flb.end());
+
+    // Stored slot order is elastic, fission, disappearance, other -- the same
+    // channel specialisation the full sweep uses -- and kslot maps each stored
+    // slot back to the pipeline's `kind` index so the curvefit and the
+    // numerators land in the same place.
+    int kslot[4];
+    fl_nch_ = 0;
+    kslot[fl_nch_++] = 3;
+    if (fast_has_fis_) kslot[fl_nch_++] = 1;
+    if (fast_has_dis_) kslot[fl_nch_++] = 2;
+    if (fast_has_oth_) kslot[fl_nch_++] = 0;
+
+    constexpr size_t DPL = 8; // doubles per 64-byte line
+    vector<size_t> sz(n_sub);
+    size_t tot = 0;
+    for (int w = 0; w < n_sub; ++w) {
+      size_t npw = (size_t)(fle[w] - fls[w]);
+      size_t need = (size_t)FL_HDR + (size_t)fl_order_ * fl_nch_
+                    + (size_t)fast_soa_stride_ * npw;
+      sz[w] = (need + DPL - 1) / DPL * DPL;
+      tot += sz[w];
+    }
+    fl_blk_.assign(tot + DPL, 0.0);
+    size_t pad = ((64 - ((uintptr_t)fl_blk_.data() % 64)) % 64) / sizeof(double);
+    fl_base_ = fl_blk_.data() + pad;
+
+    fl_win_.resize(n_sub);
+    size_t off = 0;
+    for (int w = 0; w < n_sub; ++w) {
+      double lo = fl_bounds_[w], hi = fl_bounds_[w + 1];
+      int npw = (int)(fle[w] - fls[w]);
+      double wid = hi - lo;
+      fl_win_[w] = {lo, hi, wid > 0.0 ? 1.0 / wid : 0.0, (uint32_t)off,
+                    (uint32_t)npw};
+      double* Bw = fl_base_ + off;
+      Bw[0] = lo;
+      Bw[1] = hi;
+      Bw[2] = wid > 0.0 ? 1.0 / wid : 0.0;
+      // [3] packs (next block offset, pole count). np cannot be derived from
+      // the block size because sizes are padded up to a 64-byte line. 0 marks
+      // the last block so the advance has a stop without a bounds array.
+      {
+        uint32_t two[2] = {
+          (w + 1 < n_sub) ? (uint32_t)(off + sz[w]) : 0u, (uint32_t)npw};
+        std::memcpy(&Bw[3], two, sizeof(double));
+      }
+      Bw += FL_HDR;
+      for (int g = 0; g < fl_nch_; ++g)
+        for (int i = 0; i < fl_order_; ++i)
+          Bw[g * fl_order_ + i] = flcf(w, i, kslot[g]);
+
+      double* Pp = Bw + (size_t)fl_order_ * fl_nch_;
+      double E_lo = lo * lo, E_hi = hi * hi;
+      for (int k = 0; k < npw; ++k) {
+        int gi = (int)fli[fls[w] + k];
+        double a = poles[gi].real(), b = poles[gi].imag();
+        Pp[k] = a;
+        Pp[npw + k] = b * b;
+        for (int g = 0; g < fl_nch_; ++g) {
+          std::complex<double> r = 0.0;
+          for (int c = 0; c < n_mts; ++c) {
+            // thresholds are sub-window boundaries, so a channel is either
+            // fully on or fully off here -- same test the pipeline fitted with
+            if (kind[c] != kslot[g])
+              continue;
+            if (!(e_on[c] <= E_lo * (1.0 + 1e-12) &&
+                  e_off[c] >= E_hi * (1.0 - 1e-12)))
+              continue;
+            r += residues(gi, c);
+          }
+          double rr = r.real(), ri = r.imag();
+          Pp[(2 + 2 * g) * npw + k] = rr;
+          Pp[(3 + 2 * g) * npw + k] = -(rr * a + ri * b);
+        }
+      }
+      off += sz[w];
+    }
+
+    // Segment table + a small uniform cell index onto it. Both are tiny
+    // (measured 3.1 sub-windows per segment over the library), so they stay
+    // cache-hot, and the per-lookup work becomes: one cell load, a short
+    // advance, then ARITHMETIC for the sub-window inside the segment.
+    int n_seg = sw0.shape(0);
+    fl_seg_.resize(n_seg);
+    for (int i = 0; i < n_seg; ++i) {
+      double a = slo[i], b = shi[i];
+      int nw = (int)snw[i];
+      fl_seg_[i] = {a, b, nw / (b - a), (int32_t)sw0[i], (int32_t)nw};
+    }
+    // Old strategy's index, kept so both can be A/B'd in ONE binary: the
+    // machine drifts 7-64% between runs here, far more than the difference
+    // being measured, so separate-binary comparisons cannot resolve it.
+    {
+      int nc0 = 4 * n_sub;
+      double a = fl_bounds_.front(), b = fl_bounds_.back();
+      fl_cell_inv_du_ = nc0 / (b - a);
+      fl_cell_first_.resize(nc0);
+      int ww = 0;
+      for (int i = 0; i < nc0; ++i) {
+        double u_cell = a + i / fl_cell_inv_du_;
+        while (ww < n_sub - 1 && fl_bounds_[ww + 1] <= u_cell)
+          ++ww;
+        fl_cell_first_[i] = ww;
+      }
+    }
+    {
+      int nc0 = (int)fl_cell_first_.size();
+      fl_cell_blk_.resize(nc0);
+      for (int i = 0; i < nc0; ++i)
+        fl_cell_blk_[i] = fl_win_[fl_cell_first_[i]].off;
+    }
+    fl_u0_ = fl_bounds_.front();
+    double u_top = fl_bounds_.back();
+    int n_cells = 4 * n_seg;
+    fl_seg_cell_inv_du_ = n_cells / (u_top - fl_u0_);
+    fl_cell_seg_.resize(n_cells);
+    int sg = 0;
+    for (int i = 0; i < n_cells; ++i) {
+      double u_cell = fl_u0_ + i / fl_seg_cell_inv_du_;
+      while (sg < n_seg - 1 && fl_seg_[sg].u_hi <= u_cell)
+        ++sg;
+      fl_cell_seg_[i] = sg;
+    }
+    fl_have_ = true;
+  }
+}
+
+//! Fast-range sweep, specialised at COMPILE TIME on which collapsed channels
+//! the nuclide uses. Real second-order sections, denominator kept FACTORED.
+template <bool FIS, bool DIS, bool OTH>
+static inline void fast_sweep(const double* B, int np, double u, double& el,
+  double& fis, double& dis, double& oth)
+{
+  constexpr int I_FIS = 1;
+  constexpr int I_DIS = I_FIS + (FIS ? 1 : 0);
+  constexpr int I_OTH = I_DIS + (DIS ? 1 : 0);
+  const double* al = B;
+  const double* be2 = B + np;
+#pragma omp simd reduction(+ : el, fis, dis, oth)
+  for (int k = 0; k < np; ++k) {
+    double du = u - al[k];
+    double inv = 1.0 / (du * du + be2[k]);
+    el += (B[2 * np + k] * u + B[3 * np + k]) * inv;
+    if (FIS)
+      fis += (B[(2 + 2 * I_FIS) * np + k] * u
+              + B[(3 + 2 * I_FIS) * np + k]) * inv;
+    if (DIS)
+      dis += (B[(2 + 2 * I_DIS) * np + k] * u
+              + B[(3 + 2 * I_DIS) * np + k]) * inv;
+    if (OTH)
+      oth += (B[(2 + 2 * I_OTH) * np + k] * u
+              + B[(3 + 2 * I_OTH) * np + k]) * inv;
+  }
+}
+
+//! Rewindowed flight evaluation: window-local Horner curvefit seeded into the
+//! accumulators, then the retained-pole sweep adds on top. No phi[], no
+//! partial-channel clamps, no fw_data_ touch -- thresholds are window edges.
+template <bool FIS, bool DIS, bool OTH>
+static inline void fl_eval(const double* B, int order, int np, double u,
+  double t, double& el, double& fis, double& dis, double& oth)
+{
+  constexpr int I_FIS = 1;
+  constexpr int I_DIS = I_FIS + (FIS ? 1 : 0);
+  constexpr int I_OTH = I_DIS + (DIS ? 1 : 0);
+  constexpr int NC = 1 + (FIS ? 1 : 0) + (DIS ? 1 : 0) + (OTH ? 1 : 0);
+  auto horner = [&](int g) {
+    const double* c = B + g * order;
+    double v = c[order - 1];
+    for (int i = order - 2; i >= 0; --i)
+      v = v * t + c[i];
+    return v;
+  };
+  el = horner(0);
+  if (FIS)
+    fis = horner(I_FIS);
+  if (DIS)
+    dis = horner(I_DIS);
+  if (OTH)
+    oth = horner(I_OTH);
+}
+
+//! Pole base pointer for a block whose curvefit occupies order*NC doubles.
+template <bool FIS, bool DIS, bool OTH>
+static inline const double* fl_poles(const double* B, int order)
+{
+  constexpr int NC = 1 + (FIS ? 1 : 0) + (DIS ? 1 : 0) + (OTH ? 1 : 0);
+  return B + order * NC;
 }
 
 std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   double E) const
 {
   double sqrtE = std::sqrt(E);
+
+  if (fl_have_) {
+    uint64_t prof_fl0 = wmp_prof_tick_sub();
+    // DEFAULT is the cell table + linear advance. The segment-arithmetic
+    // alternative (WMP_FL_SEARCH=arith) is 24% SLOWER on the search and 1.7%
+    // on the whole fast flight -- measured same-binary, order reversed, four
+    // runs, identical leakage. Not because arithmetic is expensive: both do
+    // three loads, but the cell grid is 4x finer than the windows so the
+    // advance almost always exits at once, letting the CPU speculate `w` and
+    // issue fl_win_[w] IN PARALLEL with the bounds check (chain depth 2).
+    // Under the segment scheme, `w = S.win0 + (u-S.u_lo)*S.inv_du` is a true
+    // data dependency on the segment record, so fl_win_[w] cannot issue until
+    // it returns, with an FP multiply and convert inside the chain (depth 3).
+    // Making the index arithmetic serialised two loads that used to overlap.
+    static const bool use_loop = [] {
+      const char* e = std::getenv("WMP_FL_SEARCH");
+      return !(e && std::string(e) == "arith");
+    }();
+    // WMP_FL_HDR=0 restores the separate fl_win_ record for A/B.
+    static const bool use_hdr = [] {
+      const char* e = std::getenv("WMP_FL_HDR");
+      return !(e && e[0] == '0');
+    }();
+    if (use_hdr && use_loop) {
+      int cell = (int)((sqrtE - fl_u0_) * fl_cell_inv_du_);
+      cell = std::min(std::max(cell, 0), (int)fl_cell_blk_.size() - 1);
+      const double* H = fl_base_ + fl_cell_blk_[cell];
+      uint32_t two[2];
+      std::memcpy(two, &H[3], sizeof(double));
+      // advance: u_hi and the next offset both come from the line already
+      // loaded, so a step costs no extra array
+      while (sqrtE >= H[1] && two[0] != 0u) {
+        H = fl_base_ + two[0];
+        std::memcpy(two, &H[3], sizeof(double));
+      }
+      double t = (sqrtE - H[0]) * H[2];
+      int np = (int)two[1];
+      const double* B = H + FL_HDR;
+      double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
+      int mask = (fast_has_fis_ ? 4 : 0) | (fast_has_dis_ ? 2 : 0)
+                 | (fast_has_oth_ ? 1 : 0);
+      switch (mask) {
+      case 0: fl_eval<false,false,false>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<false,false,false>(fl_poles<false,false,false>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      case 1: fl_eval<false,false,true>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<false,false,true>(fl_poles<false,false,true>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      case 2: fl_eval<false,true,false>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<false,true,false>(fl_poles<false,true,false>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      case 3: fl_eval<false,true,true>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<false,true,true>(fl_poles<false,true,true>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      case 4: fl_eval<true,false,false>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<true,false,false>(fl_poles<true,false,false>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      case 5: fl_eval<true,false,true>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<true,false,true>(fl_poles<true,false,true>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      case 6: fl_eval<true,true,false>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<true,true,false>(fl_poles<true,true,false>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      default: fl_eval<true,true,true>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
+        fast_sweep<true,true,true>(fl_poles<true,true,true>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
+      }
+      el = std::max(el, 0.0); fis = std::max(fis, 0.0);
+      dis = std::max(dis, 0.0); oth = std::max(oth, 0.0);
+      return {el + fis + dis + oth, el, dis + fis, fis};
+    }
+    int w;
+    if (use_loop) {
+      int n_sub2 = (int)fl_win_.size();
+      int cell = (int)((sqrtE - fl_u0_) * fl_cell_inv_du_);
+      cell = std::min(std::max(cell, 0), (int)fl_cell_first_.size() - 1);
+      w = fl_cell_first_[cell];
+      // WMP_FL_BOUNDS=1 restores the old separate-array check for A/B.
+      static const bool use_bounds_array =
+        std::getenv("WMP_FL_BOUNDS") != nullptr;
+      if (use_bounds_array) {
+        while (w < n_sub2 - 1 && sqrtE >= fl_bounds_[w + 1])
+          ++w;
+      } else {
+        while (w < n_sub2 - 1 && sqrtE >= fl_win_[w].u_hi)
+          ++w;
+      }
+    } else {
+      int cell = (int)((sqrtE - fl_u0_) * fl_seg_cell_inv_du_);
+      cell = std::min(std::max(cell, 0), (int)fl_cell_seg_.size() - 1);
+      int sgi = fl_cell_seg_[cell];
+      int n_seg = (int)fl_seg_.size();
+      while (sgi < n_seg - 1 && sqrtE >= fl_seg_[sgi].u_hi)
+        ++sgi;
+      const FlSeg& S = fl_seg_[sgi];
+      int j = (int)((sqrtE - S.u_lo) * S.inv_du);
+      j = std::min(std::max(j, 0), S.nwin - 1);
+      w = S.win0 + j;
+    }
+    const FlWin& W = fl_win_[w];
+    const double* B = fl_base_ + W.off + FL_HDR;
+    double t = (sqrtE - W.u_lo) * W.inv_w;
+    int np = (int)W.np;
+    double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
+    int mask = (fast_has_fis_ ? 4 : 0) | (fast_has_dis_ ? 2 : 0)
+               | (fast_has_oth_ ? 1 : 0);
+    WMP_PROF_FENCE();
+    wmp_prof_add_sub(WPROF_FL_SEARCH, prof_fl0);
+    uint64_t prof_fl1 = wmp_prof_tick_sub();
+#define FL_CASE(M, A, B_, C)                                                   \
+  case M:                                                                      \
+    fl_eval<A, B_, C>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);          \
+    WMP_PROF_FENCE();                                                          \
+    wmp_prof_add_sub(WPROF_FL_CURVE, prof_fl1);                                \
+    prof_fl1 = wmp_prof_tick_sub();                                            \
+    fast_sweep<A, B_, C>(                                                      \
+      fl_poles<A, B_, C>(B, fl_order_), np, sqrtE, el, fis, dis, oth);         \
+    break;
+    switch (mask) {
+      FL_CASE(0, false, false, false)
+      FL_CASE(1, false, false, true)
+      FL_CASE(2, false, true, false)
+      FL_CASE(3, false, true, true)
+      FL_CASE(4, true, false, false)
+      FL_CASE(5, true, false, true)
+      FL_CASE(6, true, true, false)
+    default:
+      FL_CASE(7, true, true, true)
+    }
+#undef FL_CASE
+    WMP_PROF_FENCE();
+    wmp_prof_add_sub(WPROF_FL_SWEEP, prof_fl1);
+    el = std::max(el, 0.0);
+    fis = std::max(fis, 0.0);
+    dis = std::max(dis, 0.0);
+    oth = std::max(oth, 0.0);
+    return {el + fis + dis + oth, el, dis + fis, fis};
+  }
 
   // O(1) window lookup over the fast bounds
   int n_win = fw_off_.size() - 1;
@@ -559,23 +897,23 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   std::complex<double> phi[FAST_MAX_ACTIVE];
   bool need_phi = !fast_partials_[w].empty();
   double u = sqrtE;
-  const double* B = &fw_soa_[(size_t)10 * k0];
-  const double *al = B, *be2 = B + np;
-  const double *ne1 = B + 2 * np, *ne0 = B + 3 * np;
-  const double *nf1 = B + 4 * np, *nf0 = B + 5 * np;
-  const double *nd1 = B + 6 * np, *nd0 = B + 7 * np;
-  const double *no1 = B + 8 * np, *no0 = B + 9 * np;
+  const double* B = &fw_soa_[(size_t)fast_soa_stride_ * k0];
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
-  // The reduction clause is required for vectorization: without it the four
-  // FP sums are order-dependent and GCC keeps the loop scalar.
-#pragma omp simd reduction(+ : el, fis, dis, oth)
-  for (int k = 0; k < np; ++k) {
-    double du = u - al[k];
-    double inv = 1.0 / (du * du + be2[k]);
-    el += (ne1[k] * u + ne0[k]) * inv;
-    fis += (nf1[k] * u + nf0[k]) * inv;
-    dis += (nd1[k] * u + nd0[k]) * inv;
-    oth += (no1[k] * u + no0[k]) * inv;
+  // One switch on a per-nuclide constant; each instantiation carries
+  // COMPILE-TIME slot offsets and sweeps only the channels that exist.
+  // All eight combinations are instantiated -- an unhandled one would read
+  // the wrong slots and feed garbage cross sections to the transport loop.
+  int mask = (fast_has_fis_ ? 4 : 0) | (fast_has_dis_ ? 2 : 0)
+             | (fast_has_oth_ ? 1 : 0);
+  switch (mask) {
+  case 0: fast_sweep<false, false, false>(B, np, u, el, fis, dis, oth); break;
+  case 1: fast_sweep<false, false, true>(B, np, u, el, fis, dis, oth); break;
+  case 2: fast_sweep<false, true, false>(B, np, u, el, fis, dis, oth); break;
+  case 3: fast_sweep<false, true, true>(B, np, u, el, fis, dis, oth); break;
+  case 4: fast_sweep<true, false, false>(B, np, u, el, fis, dis, oth); break;
+  case 5: fast_sweep<true, false, true>(B, np, u, el, fis, dis, oth); break;
+  case 6: fast_sweep<true, true, false>(B, np, u, el, fis, dis, oth); break;
+  default: fast_sweep<true, true, true>(B, np, u, el, fis, dis, oth); break;
   }
   if (need_phi) {
     const std::complex<double>* rec = &fw_data_[(size_t)k0 * FW_STRIDE];
@@ -662,7 +1000,7 @@ void WindowedMultipole::evaluate_fast_channels(double E, double* out) const
       s += crc[k].real() * pr_[k] - crc[k].imag() * pi_[k];
     out[c] = (s > 0.0) ? s : 0.0;
   }
-  wmp_prof_add(WPROF_COLL_CHAN, prof_t0);
+  wmp_prof_add_sub(WPROF_COLL_CHAN, prof_t0);
 }
 
 void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
@@ -692,94 +1030,52 @@ void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
   }
 }
 
-std::tuple<double, double, double> WindowedMultipole::lowe_correction(
-  double sqrtE, double xi, int i_window) const
+//! Broadened pole sweep, specialised at COMPILE TIME on the record stride and
+//! whether the nuclide is fissionable.
+//!
+//! 30 of the 32 nuclides in a PWR problem are non-fissionable and carried an
+//! all-zero fission residue -- 2 of every 8 doubles in a pole record. Removing
+//! it was tried once with a RUNTIME stride and an in-loop `if (fiss)` and cost
+//! 20%: the compiler could no longer fold constant offsets or unroll. As
+//! template parameters, both variants keep folded offsets and neither branches.
+template <int STRIDE, bool FISS>
+static inline void pole_sweep(const double* pol, int np, double sqrtE,
+  double invE, double inv_xi, double& sig_s, double& sig_a, double& sig_f)
 {
-  // Gather this window's non-1/v poles (pool + externals) with their
-  // per-channel residues into fixed stack buffers as struct-of-arrays doubles
-  // (no heap, and the inner loop is hand-rolled/vectorizable -- std::complex
-  // division/multiply route through guarded libcalls, far too slow for a path
-  // that fires on nearly every thermal lookup for light nuclides). The 1/v
-  // pole (Re p == 0) is excluded: it is broadening-invariant and already
-  // exact (its pool SoA residues are zeroed and it is added separately).
-  constexpr int MAXP = 256;
-  double Ppr[MAXP], Ppi[MAXP];
-  double Rsr[MAXP], Rsi[MAXP], Rar[MAXP], Rai[MAXP], Rfr[MAXP], Rfi[MAXP];
-  int n = 0;
-  double hi = sqrtE + 5.0 * xi;
-  bool narrow = false; // any pole triggers a refined pocket in lowe_nodes?
-  auto take = [&](double a, double b, std::complex<double> rs,
-                std::complex<double> ra, std::complex<double> rf) {
-    if (std::abs(a) < 1e-12 || n >= MAXP)
-      return; // 1/v pole (or overflow guard)
-    Ppr[n] = a;
-    Ppi[n] = b;
-    Rsr[n] = rs.real();
-    Rsi[n] = rs.imag();
-    Rar[n] = ra.real();
-    Rai[n] = ra.imag();
-    Rfr[n] = rf.real();
-    Rfi[n] = rf.imag();
-    if (b < hi * 0.25 && -8.0 * b < a && a < hi + 8.0 * b)
-      narrow = true;
-    ++n;
-  };
-  int ps = win_start_[i_window], pe = win_end_[i_window];
-  for (int i = ps; i < pe; ++i)
-    take(gs_pr_[i], gs_pi_[i], {gs_sr_[i], gs_si_[i]}, {gs_ar_[i], gs_ai_[i]},
-      {gs_fr_[i], gs_fi_[i]});
-  int n_ext = ext_data_.shape(1);
-  for (int j = 0; j < n_ext; ++j) {
-    const std::complex<double>* rec = &ext_data_(i_window, j, 0);
-    take(rec[0].real(), rec[0].imag(), rec[1], rec[2], rec[3]);
+  const double sq = SQRT_PI * inv_xi;
+#pragma omp simd reduction(+ : sig_s, sig_a, sig_f)
+  for (int k = 0; k < np; ++k) {
+    const double* r = pol + (size_t)k * STRIDE;
+    double pr = r[0], pi = r[1];
+    double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
+    double zr = (pr - sqrtE) * inv_xi;
+    double zi = pi * inv_xi + 0.9;
+    double nr = 0.0, ni = 0.564189504758109, t;
+    t = nr*zr - ni*zi; ni = nr*zi + ni*zr; nr = t - 0.507771291744591;
+    t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 8.07354660639634; nr = t;
+    t = nr*zr - ni*zi + 6.75847413957232; ni = nr*zi + ni*zr; nr = t;
+    t = nr*zr - ni*zi; ni = nr*zi + ni*zr + 31.490536152863; nr = t;
+    t = nr*zr - ni*zi - 21.9357456686406; ni = nr*zi + ni*zr; nr = t;
+    t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 32.310199761603; nr = t;
+    t = nr*zr - ni*zi + 11.7559071436993; ni = nr*zi + ni*zr; nr = t;
+    double zzr = zr*zr - zi*zi, zzi = 2.0*zr*zi;
+    double dnr = 1.0, dni = 0.0;
+    t = dnr*zzr - dni*zzi - 14.0; dni = dnr*zzi + dni*zzr; dnr = t;
+    t = dnr*zzr - dni*zzi + 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
+    t = dnr*zzr - dni*zzi - 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
+    t = dnr*zzr - dni*zzi + 6.5625; dni = dnr*zzi + dni*zzr; dnr = t;
+    double dm = 1.0 / (dnr*dnr + dni*dni);
+    double wr = (nr*dnr + ni*dni) * dm;
+    double wi = (ni*dnr - nr*dni) * dm;
+    double wgr = -sq * wi, wgi = sq * wr;
+    double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
+    double br = (sqrtE + pr + hr) * invE;
+    double bi = (pi + hi) * invE;
+    sig_s += r[2] * br - r[3] * bi;
+    sig_a += r[4] * br - r[5] * bi;
+    if (FISS)
+      sig_f += r[6] * br - r[7] * bi;
   }
-  if (n == 0)
-    return std::make_tuple(0.0, 0.0, 0.0);
-
-  // Quadrature of the image-kernel integral: exp(-((u'+u)/xi)^2) times the
-  // even part of u'^2 * sigma(u') over (0, u + 5*xi). One GL node contributes
-  // (hand-rolled: 1/(u'-p) has real part (u'-pr)/den, imag part pi/den):
-  double cs = 0.0, ca = 0.0, cf = 0.0;
-  auto add_node = [&](double up, double wgt) {
-    double kp = std::exp(-((up + sqrtE) / xi) * ((up + sqrtE) / xi));
-    double sk = 0.0, ak = 0.0, fk = 0.0;
-#pragma omp simd reduction(+ : sk, ak, fk)
-    for (int m = 0; m < n; ++m) {
-      double pr = Ppr[m], pi = Ppi[m];
-      double d1 = up - pr, d2 = -up - pr;
-      double inv1 = 1.0 / (d1 * d1 + pi * pi);
-      double inv2 = 1.0 / (d2 * d2 + pi * pi);
-      double phr = d1 * inv1 + d2 * inv2; // Re[1/(u'-p) + 1/(-u'-p)]
-      double phi = pi * (inv1 + inv2);    // Im of the same
-      sk += Rsr[m] * phr - Rsi[m] * phi;
-      ak += Rar[m] * phr - Rai[m] * phi;
-      fk += Rfr[m] * phr - Rfi[m] * phi;
-    }
-    double wk = wgt * kp * up * up;
-    cs += wk * sk;
-    ca += wk * ak;
-    cf += wk * fk;
-  };
-
-  if (!narrow) {
-    // HOT PATH (H1/O16/actinides): a single GL-12 panel over (0, hi) from the
-    // static table -- no heap, no Newton. Bit-identical to lowe_nodes here,
-    // which returns exactly this when no pole is narrow enough for a pocket.
-    double c = 0.5 * hi;
-    for (int k = 0; k < N_GL12; ++k)
-      add_node(c * (GL12_X[k] + 1.0), c * GL12_W[k]);
-  } else {
-    // RARE PATH: composite pockets around narrow background pole(s).
-    std::complex<double> Pc[MAXP];
-    for (int m = 0; m < n; ++m)
-      Pc[m] = {Ppr[m], Ppi[m]};
-    std::vector<double> ug, wg;
-    lowe_nodes(hi, Pc, n, ug, wg);
-    for (std::size_t g = 0; g < ug.size(); ++g)
-      add_node(ug[g], wg[g]);
-  }
-  double norm = 1.0 / (xi * SQRT_PI * sqrtE * sqrtE);
-  return std::make_tuple(cs * norm, ca * norm, cf * norm);
 }
 
 std::tuple<double, double, double> WindowedMultipole::evaluate(
@@ -802,11 +1098,20 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     // Variable-width windows: O(1) two-level index (uniform coarse grid in
     // sqrt(E) + short forward walk; see wmp.h)
     int n_win = win_start_.size();
-    int cell = (int)((sqrtE - sqrtE_bounds_[0]) * cell_inv_du_);
-    cell = std::min(std::max(cell, 0), (int)cell_first_.size() - 1);
-    int i_window = cell_first_[cell];
-    while (i_window < n_win - 1 && sqrtE >= sqrtE_bounds_[i_window + 1])
-      ++i_window;
+    int i_window;
+    if (grid_uniform_) {
+      // ARITHMETIC ONLY -- no table, no scan, no dependent load
+      i_window = (sqrtE < grid_u_lowe_)
+        ? 0
+        : 1 + (int)((sqrtE - grid_u_lowe_) * grid_inv_spacing_);
+      i_window = std::min(std::max(i_window, 0), n_win - 1);
+    } else {
+      int cell = (int)((sqrtE - win_u_lo_) * cell_inv_du_);
+      cell = std::min(std::max(cell, 0), (int)cell_first_.size() - 1);
+      i_window = cell_first_[cell];
+      while (i_window < n_win - 1 && sqrtE >= win_[i_window].u_hi)
+        ++i_window;
+    }
 
     double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
     int n_ext = ext_data_.shape(1);
@@ -886,112 +1191,51 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     // zpf8h Faddeeva sigma basis (Im(z)=beta/xi>0 for resonance poles, so no
     // conjugation); the 1/v pole's SoA residues are zeroed here and its exact
     // 0K contribution is added below. At T=0 the plain pole sum.
+    // ONE offset into this window's contiguous block, then a sequential run:
+    // curvefit triplets first, then this window's pole records.
+    const int ncf3 = cf_present_ ? cf_n_ * cf_ch_ : 0;
+    const WinRec& wrec = win_[i_window];   // one line: bound, offset, np, flags
+    const double* blk = &blk_[wrec.blk_off];
+    const double* pol = blk + ncf3;
+    const int np_w = wrec.np;
     int ps = win_start_[i_window], pe = win_end_[i_window];
     if (xi <= 0.0) {
-      for (int i = ps; i < pe; ++i) {
-        double dr = sqrtE - gs_pr_[i], di = -gs_pi_[i];
+      // one 64 B record per pole, sequential -> one cache line per pole
+      const double* rec = pol;
+      const int gstr = gs_stride_;
+      for (int i = 0; i < np_w; ++i, rec += gstr) {
+        double dr = sqrtE - rec[0], di = -rec[1];
         double minv = 1.0 / (dr * dr + di * di);
         double br = dr * minv, bi = -di * minv;
-        sig_s += gs_sr_[i] * br - gs_si_[i] * bi;
-        sig_a += gs_ar_[i] * br - gs_ai_[i] * bi;
-        sig_f += gs_fr_[i] * br - gs_fi_[i] * bi;
+        sig_s += rec[2] * br - rec[3] * bi;
+        sig_a += rec[4] * br - rec[5] * bi;
+        if (fissionable_)
+          sig_f += rec[6] * br - rec[7] * bi;
       }
     } else {
-      // NEAR/FAR PARTITION -- 1x work AND vectorized (strictly beats
-      // compute-both). The cheap analytic Laurent base is computed for EVERY
-      // pole (vectorizes); the EXPENSIVE zpf8h Faddeeva is done ONLY for the
-      // NEAR poles (|z|^2 < 25*xi^2), which are first COMPACTED into a
-      // contiguous scratch so that loop vectorizes too, then scattered back
-      // over the analytic value. Far poles keep the analytic base (also the
-      // cancellation-safe form they require). This removes the wasted zpf8h
-      // on far poles that made Na-23 (sparse, mostly-far windows) slower.
-      // 1/v pole: zeroed SoA residues -> contributes 0 in the reduction.
-      double sq = SQRT_PI * inv_xi;
-      double xi2 = xi * xi, thr = 25.0 * xi2;
-      constexpr int MAXP = 64;
-      double bR[MAXP], bI[MAXP], m2v[MAXP];
-      double nPr[MAXP], nPi[MAXP], nbR[MAXP], nbI[MAXP];
-      int nK[MAXP];
-      for (int base = ps; base < pe; base += MAXP) {
-        int np = std::min(MAXP, pe - base);
-        // PASS 1: analytic Laurent base for ALL poles (vectorizes)
-#pragma omp simd
-        for (int k = 0; k < np; ++k) {
-          double pr = gs_pr_[base + k], pi = gs_pi_[base + k];
-          double dr = sqrtE - pr, di = -pi;
-          double m2 = dr * dr + di * di;
-          m2v[k] = m2;
-          double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
-          double minv = 1.0 / m2;
-          double ir = dr * minv, ii = -di * minv;
-          double tr = xi2 * (ir * ir - ii * ii), ti = xi2 * (2.0 * ir * ii);
-          double cr0 = 0.75 + 1.875 * tr, ci0 = 1.875 * ti;
-          double hr0 = 0.5 + (tr * cr0 - ti * ci0), hi0 = tr * ci0 + ti * cr0;
-          double cr = tr * hr0 - ti * hi0, ci = tr * hi0 + ti * hr0;
-          double qr = p2r * invE, qi = p2i * invE;
-          double gr = 1.0 + (qr * cr - qi * ci), gi = qr * ci + qi * cr;
-          bR[k] = gr * ir - gi * ii;
-          bI[k] = gr * ii + gi * ir;
-        }
-        // PASS 2: compact the near poles (|z|<5) into contiguous scratch
-        int nn = 0;
-        for (int k = 0; k < np; ++k) {
-          if (m2v[k] < thr) {
-            nPr[nn] = gs_pr_[base + k];
-            nPi[nn] = gs_pi_[base + k];
-            nK[nn] = k;
-            ++nn;
-          }
-        }
-        // PASS 3: zpf8h Faddeeva base for near poles only (contiguous ->
-        // vectorizes). zs = (pr-sqrtE, pi)/xi + (0, 0.9)
-#pragma omp simd
-        for (int j = 0; j < nn; ++j) {
-          double pr = nPr[j], pi = nPi[j];
-          double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
-          double zr = (pr - sqrtE) * inv_xi;
-          double zi = pi * inv_xi + 0.9;
-          double nr = 0.0, ni = 0.564189504758109, t;
-          t = nr*zr - ni*zi; ni = nr*zi + ni*zr; nr = t - 0.507771291744591;
-          t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 8.07354660639634; nr = t;
-          t = nr*zr - ni*zi + 6.75847413957232; ni = nr*zi + ni*zr; nr = t;
-          t = nr*zr - ni*zi; ni = nr*zi + ni*zr + 31.490536152863; nr = t;
-          t = nr*zr - ni*zi - 21.9357456686406; ni = nr*zi + ni*zr; nr = t;
-          t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 32.310199761603; nr = t;
-          t = nr*zr - ni*zi + 11.7559071436993; ni = nr*zi + ni*zr; nr = t;
-          double zzr = zr*zr - zi*zi, zzi = 2.0*zr*zi;
-          double dnr = 1.0, dni = 0.0;
-          t = dnr*zzr - dni*zzi - 14.0; dni = dnr*zzi + dni*zzr; dnr = t;
-          t = dnr*zzr - dni*zzi + 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
-          t = dnr*zzr - dni*zzi - 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
-          t = dnr*zzr - dni*zzi + 6.5625; dni = dnr*zzi + dni*zzr; dnr = t;
-          double dm = 1.0 / (dnr*dnr + dni*dni);
-          double wr = (nr*dnr + ni*dni) * dm;
-          double wi = (ni*dnr - nr*dni) * dm;
-          double wgr = -sq * wi, wgi = sq * wr;
-          double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
-          nbR[j] = (sqrtE + pr + hr) * invE;
-          nbI[j] = (pi + hi) * invE;
-        }
-        // PASS 4: scatter near results over the analytic base
-        for (int j = 0; j < nn; ++j) {
-          bR[nK[j]] = nbR[j];
-          bI[nK[j]] = nbI[j];
-        }
-        // PASS 5: residue reduction (vectorizes)
-#pragma omp simd reduction(+ : sig_s, sig_a, sig_f)
-        for (int k = 0; k < np; ++k) {
-          sig_s += gs_sr_[base + k] * bR[k] - gs_si_[base + k] * bI[k];
-          sig_a += gs_ar_[base + k] * bR[k] - gs_ai_[base + k] * bI[k];
-          sig_f += gs_fr_[base + k] * bR[k] - gs_fi_[base + k] * bI[k];
-        }
-      }
+      // UNIFORM zpf8h SWEEP -- no near/far partition, no branch, one pass.
+      // PROJECT.md §5.6 recorded "catastrophic cancellation in the sigma basis
+      // at large |z| -- needs the analytic Laurent form". Measured 2026-07-29
+      // that does NOT apply to the zpf8h path: its error in w(z) is ~1e-7 flat
+      // from |z| = 4 to 50 and the sigma basis amplifies it by 1.0x (worst case
+      // 1e-3 AT the resonance, which we already accept); the exact form holds
+      // to 1e-15 at |z| = 100 against mpmath. The old note concerns naively
+      // substituting the Laurent SERIES of w(z), a different construction.
+      // So the partition bought speed, not accuracy, at the cost of a compare
+      // per pole plus a compaction and a scatter pass.
+      // one predictable branch on a member constant; both instantiations
+      // carry compile-time offsets (see pole_sweep).
+      if (fissionable_)
+        pole_sweep<8, true>(pol, np_w, sqrtE, invE, inv_xi,
+                            sig_s, sig_a, sig_f);
+      else
+        pole_sweep<6, false>(pol, np_w, sqrtE, invE, inv_xi,
+                             sig_s, sig_a, sig_f);
     }
     // 1/v background pole: exact 0K value (broadening-invariant, any T).
     // Tested against THIS window's pointer range -- several windows can point
     // at it, and each of them owes its 1/v contribution.
-    if (onev_present_ && onev_idx_ >= win_start_[i_window]
-        && onev_idx_ < win_end_[i_window]) {
+    if (wrec.flags & WIN_HAS_ONEV) {
       double dr = sqrtE - onev_p_.real(), di = -onev_p_.imag();
       double minv = 1.0 / (dr * dr + di * di);
       double br = dr * minv, bi = -di * minv;
@@ -1018,34 +1262,18 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         double t = invE; // 0K basis: 1/E, 1/sqrtE, 1, sqrtE, ...
         for (int k = 0; k < cf_n_; ++k) { fac[k] = t; t *= sqrtE; }
       }
-      const double* cs = &cf_s_[(size_t)i_window * cf_n_];
-      const double* ca = &cf_a_[(size_t)i_window * cf_n_];
-      const double* cf = &cf_f_[(size_t)i_window * cf_n_];
-      for (int k = 0; k < cf_n_; ++k) {
-        sig_s += cs[k] * fac[k];
-        sig_a += ca[k] * fac[k];
-        sig_f += cf[k] * fac[k];
+      // curvefit lives at the FRONT of this window's block (see wmp.h);
+      // cf_blk_ was freed once the blocks were materialised at load.
+      const double* c = blk;
+      const int nch = cf_ch_;
+      for (int k = 0; k < cf_n_; ++k, c += nch) {
+        sig_s += c[0] * fac[k];
+        sig_a += c[1] * fac[k];
+        if (fissionable_)
+          sig_f += c[2] * fac[k];
       }
     }
 
-    // Low-E free-gas image-kernel correction: the one-kernel form above
-    // neglects the exp(-((u'+u)/xi)^2) image kernel below u < LOWE_THR*xi. For
-    // light nuclides (H1) this spans the thermal range and is essential for a
-    // correct moderator (scattering) cross section. Both the correction AND
-    // the one-kernel error decay as exp(-(u/xi)^2), so the firing threshold is
-    // a SIGNIFICANCE bound, not just a form-validity bound: measured H1/O16
-    // elastic error vs ACE is unchanged from 4.5 down to 2.5, while 4.5 makes
-    // abundant mid-mass nuclides (O16 at u/xi~4 at the thermal peak) pay the
-    // quadrature for a ~1e-7 correction. 3.5 keeps the correction wherever it
-    // matters (<=5e-6 relative skipped) and stops O16 firing at thermal.
-    constexpr double LOWE_THR = 3.5;
-    if (xi > 0.0 && sqrtE < LOWE_THR * xi) {
-      double cs, ca, cf;
-      std::tie(cs, ca, cf) = lowe_correction(sqrtE, xi, i_window);
-      sig_s -= cs;
-      sig_a -= ca;
-      sig_f -= cf;
-    }
     return std::make_tuple(sig_s, sig_a, sig_f);
   }
 
@@ -1226,6 +1454,13 @@ void read_multipole_data(int i_nuclide)
   // Read nuclide data from HDF5
   hid_t group = open_group(file, nuc->name_.c_str());
   nuc->multipole_ = make_unique<WindowedMultipole>(group);
+  // Mirror the bounds into the Nuclide so the per-lookup range tests in
+  // calculate_xs need no dereference of the multipole object (see nuclide.h).
+  nuc->mp_present_ = true;
+  nuc->mp_fast_present_ = nuc->multipole_->fast_present_;
+  nuc->mp_E_min_ = nuc->multipole_->E_min_;
+  nuc->mp_E_max_ = nuc->multipole_->E_max_;
+  nuc->mp_fast_E_max_ = nuc->multipole_->fast_E_max_;
   close_group(group);
   file_close(file);
 

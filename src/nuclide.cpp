@@ -1,3 +1,5 @@
+#include <x86intrin.h>
+
 #include "openmc/nuclide.h"
 
 #include "openmc/wmp_profile.h"
@@ -664,17 +666,21 @@ void Nuclide::calculate_xs(
   // PROFILING (wmp-fast-profile branch): classify + time this lookup.
   uint64_t prof_t0 = wmp_prof_tick();
   int prof_cat = WPROF_FLIGHT_ACE;
+  // SYMMETRIC REGION TIMING: six ticks are taken on EVERY path at the same
+  // points, so ACE, fast-multipole and resolved-multipole lookups all carry
+  // identical instrumentation and their per-region costs are comparable.
+  // Regions that do not apply to a path simply measure ~0 (adjacent ticks).
+  uint64_t tH = 0, tA = 0, tB = 0, tC = 0, tD = 0, tE = 0, tF = 0, tT = 0;
+  int prof_rg_base = WPROF_RG_ACE_HEAD1;
 
   // Initialize cached cross sections to zero
   micro.elastic = CACHE_INVALID;
   micro.thermal = 0.0;
   micro.thermal_elastic = 0.0;
+  tH = wmp_prof_tick_sub();   // micro-cache init done; next is the use_mp test
 
   // Check to see if there is multipole data present at this energy
-  bool use_mp = false;
-  if (multipole_) {
-    use_mp = (p.E() >= multipole_->E_min_ && p.E() <= multipole_->E_max_);
-  }
+  bool use_mp = mp_present_ && p.E() >= mp_E_min_ && p.E() <= mp_E_max_;
   // WMP_FAST_ONLY=1: force the RESOLVED range onto the tabulated (ACE) path
   // so only the URR/fast segment uses poles -- isolates fast-range costs.
   static const bool fast_only = std::getenv("WMP_FAST_ONLY") != nullptr;
@@ -684,6 +690,12 @@ void Nuclide::calculate_xs(
   // Evaluate multipole or interpolate
   if (use_mp) {
     prof_cat = WPROF_FLIGHT_RES;
+    prof_rg_base = WPROF_RG_RES_HEAD1;
+    tA = wmp_prof_tick_sub();
+    tB = wmp_prof_tick_sub();
+    tC = wmp_prof_tick_sub();
+    tD = wmp_prof_tick_sub();
+    tE = wmp_prof_tick_sub();
     // Call multipole kernel
     double sig_s, sig_a, sig_f;
     std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(p.E(), p.sqrtkT());
@@ -725,9 +737,10 @@ void Nuclide::calculate_xs(
     micro.index_temp = -1;
     micro.index_grid = -1;
     micro.interp_factor = 0.0;
+    tF = wmp_prof_tick_sub();
 
   } else {
-    uint64_t tp = wmp_prof_tick();
+    tA = wmp_prof_tick_sub();
     // Find the appropriate temperature index.
     double kT = p.sqrtkT() * p.sqrtkT();
     double f;
@@ -772,12 +785,12 @@ void Nuclide::calculate_xs(
     const auto& xs {xs_[i_temp]};
 
     micro.index_temp = i_temp;
+    tB = wmp_prof_tick_sub();
 
     // Fast-segment multipole? The transport cross sections come from the
     // T=0 pole sums instead of the tabulated grids.
-    bool use_fast_mp = multipole_ && multipole_->fast_present_ &&
-                       p.E() > multipole_->E_max_ &&
-                       p.E() <= multipole_->fast_E_max_;
+    bool use_fast_mp =
+      mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
 
     // LAZY GRID INDEXING: a fast-multipole lookup whose transport xs come
     // entirely from poles needs the ACE grid index only at a collision
@@ -816,8 +829,9 @@ void Nuclide::calculate_xs(
       micro.index_grid = i_grid;
       micro.interp_factor = f;
     }
+    tC = wmp_prof_tick_sub();
     if (use_fast_mp)
-      wmp_prof_add(WPROF_PREAMBLE, tp);
+      prof_rg_base = WPROF_RG_FAST_HEAD1;
 
     if (!use_fast_mp) {
       // Calculate microscopic nuclide total cross section
@@ -847,15 +861,14 @@ void Nuclide::calculate_xs(
     // UNINITIALIZED -- interpolating here was UB producing garbage
     // photon_prod on every fast-multipole flight lookup). Zero it instead;
     // ensure_grid_index() fills the real value at collision time.
-    uint64_t tph = wmp_prof_tick();
+    tD = wmp_prof_tick_sub();
     if (micro.index_grid == C_NONE) {
       micro.photon_prod = 0.0;
     } else {
       micro.photon_prod = (1.0 - f) * xs(i_grid, XS_PHOTON_PROD) +
                           f * xs(i_grid + 1, XS_PHOTON_PROD);
     }
-    if (use_fast_mp)
-      wmp_prof_add(WPROF_PHOTON, tph);
+    tE = wmp_prof_tick_sub();
 
     // Depletion-related reactions
     if (simulation::need_depletion_rx) {
@@ -904,23 +917,20 @@ void Nuclide::calculate_xs(
     // these pole values (see the pole_base gate there).
     if (use_fast_mp) {
       prof_cat = WPROF_FLIGHT_FAST;
-      uint64_t tk = wmp_prof_tick();
       double sig_t, sig_s, sig_a, sig_f;
       std::tie(sig_t, sig_s, sig_a, sig_f) =
         multipole_->evaluate_fast(p.E());
-      wmp_prof_add(WPROF_KERNEL_FAST, tk);
       micro.total = sig_t;
       micro.elastic = sig_s;
       micro.absorption = sig_a;
       micro.fission = sig_f;
-      uint64_t tn = wmp_prof_tick();
       micro.nu_fission =
         fissionable_
           ? sig_f * (nu_fast_ok_ ? nu_total_fast(p.E())
                                  : this->nu(p.E(), EmissionMode::total))
           : 0.0;
-      wmp_prof_add(WPROF_NU, tn);
     }
+    tF = wmp_prof_tick_sub();
   }
 
   // Initialize sab treatment to false
@@ -936,6 +946,7 @@ void Nuclide::calculate_xs(
 
   if (i_sab >= 0)
     this->calculate_sab_xs(i_sab, sab_frac, p);
+  tT = wmp_prof_tick_sub();
 
   // If the particle is in the unresolved resonance range and there are
   // probability tables, we need to determine cross sections from the table
@@ -949,6 +960,18 @@ void Nuclide::calculate_xs(
 
   micro.last_E = p.E();
   micro.last_sqrtkT = p.sqrtkT();
+  {
+    uint64_t tG = wmp_prof_tick_sub();
+    wmp_prof_add_cycles_sub(prof_rg_base + 0, tH - prof_t0);
+    wmp_prof_add_cycles_sub(prof_rg_base + 1, tA - tH);
+    wmp_prof_add_cycles_sub(prof_rg_base + 2, tB - tA);
+    wmp_prof_add_cycles_sub(prof_rg_base + 3, tC - tB);
+    wmp_prof_add_cycles_sub(prof_rg_base + 4, tD - tC);
+    wmp_prof_add_cycles_sub(prof_rg_base + 5, tE - tD);
+    wmp_prof_add_cycles_sub(prof_rg_base + 6, tF - tE);
+    wmp_prof_add_cycles_sub(prof_rg_base + 7, tT - tF);
+    wmp_prof_add_cycles_sub(prof_rg_base + 8, tG - tT);
+  }
   wmp_prof_add(prof_cat, prof_t0);
 }
 
@@ -1127,9 +1150,8 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
   // calculate_xs). Verified vs NJOY MT4: median 1-3% (fit error on a channel
   // that is a small fraction of the total). Otherwise read tabulated MT4.
   double inelastic = 0.;
-  bool pole_inel = multipole_ && multipole_->fast_present_ &&
-                   p.E() > multipole_->E_max_ &&
-                   p.E() <= multipole_->fast_E_max_;
+  bool pole_inel =
+    mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
   if (pole_inel) {
     inelastic = micro.total - micro.elastic - micro.absorption;
     if (inelastic < 0.)
@@ -1153,9 +1175,8 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
   // pole-evaluated base — exactly the File 3 data the ptables are factors
   // of — so do not clobber micro.elastic with the tabulated value.
   if (urr.multiply_smooth_) {
-    bool pole_base = multipole_ && multipole_->fast_present_ &&
-                     p.E() > multipole_->E_max_ &&
-                     p.E() <= multipole_->fast_E_max_;
+    bool pole_base =
+      mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
     if (!pole_base) {
       calculate_elastic_xs(p);
     }

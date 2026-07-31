@@ -109,6 +109,18 @@ public:
   // Multipole data
   unique_ptr<WindowedMultipole> multipole_;
 
+  //! Multipole energy bounds, MIRRORED here out of the WindowedMultipole
+  //! object. calculate_xs tests these on EVERY flight lookup, and reading them
+  //! through multipole_ costs a pointer chase into a separate allocation
+  //! before any evaluation happens -- measured at +34 cyc on the fast path and
+  //! +70 on the resolved path against ACE, which short-circuits on a null
+  //! pointer. Holding them in the Nuclide keeps the test in already-hot data.
+  bool mp_present_ {false};      //!< multipole_ != nullptr
+  bool mp_fast_present_ {false}; //!< multipole_->fast_present_
+  double mp_E_min_ {0.0};
+  double mp_E_max_ {0.0};
+  double mp_fast_E_max_ {0.0};
+
   // O(1) total-nu lookup for the fast-multipole flight path. ACE carries
   // nu*sigma_f pre-multiplied on the grid, but the pole path must evaluate
   // nu(E) itself -- a per-lookup Tabulated1D binary search (~100+ cycles).
