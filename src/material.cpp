@@ -1,8 +1,10 @@
 #include "openmc/material.h"
 
 #include <algorithm> // for min, max, sort, fill
+#include <atomic>    // for the WMP_ETRAP bad-energy counter
 #include <cassert>
 #include <cmath>
+#include <cstdlib> // for getenv (WMP_ETRAP)
 #include <iterator>
 #include <sstream>
 #include <string>
@@ -829,8 +831,43 @@ void Material::calculate_neutron_xs(Particle& p) const
 {
   // Find energy index on energy grid
   int neutron = ParticleType::neutron().transport_index();
-  int i_grid =
-    std::log(p.E() / data::energy_min[neutron]) / simulation::log_spacing;
+  // GUARD: log(0) is -inf and (int) of a non-finite double is UB -- on x86
+  // cvttsd2si yields 0x80000000 = INT_MIN, which then indexes
+  // grid.grid_index[] far out of bounds and segfaults inside
+  // Nuclide::calculate_xs instead of reporting a bad energy. Stock OpenMC has
+  // no clamp here; with ACE-only data the state never arises. WMP_ETRAP=1
+  // reports the particle AND the event that produced the bad energy.
+  const double E_ = p.E();
+  int i_grid;
+  if (E_ >= data::energy_min[neutron]) {
+    i_grid = std::log(E_ / data::energy_min[neutron]) / simulation::log_spacing;
+  } else if (E_ > 0.0) {
+    // BELOW THE DATA FLOOR, but physical: neutrons do thermalize under
+    // 1e-5 eV. Stock OpenMC produces a NEGATIVE index here and reads
+    // grid_index[] out of bounds; Nuclide::calculate_xs then clamps with its
+    // own `E < grid.energy.front()` branch, so the bad index is never used --
+    // but computing it is still UB. Clamp and carry on SILENTLY: this is a
+    // normal state, it occurs with ACE-only data at the same rate (measured
+    // 2026-08-13: 30 per 20M histories, ACE and WMP alike), and it is not a
+    // fault worth reporting.
+    i_grid = 0;
+  } else {
+    // E <= 0 or NaN. NOT physical, and the real hazard: NaN fails BOTH bounds
+    // checks in Nuclide::calculate_xs (`NaN < x` and `NaN > x` are both
+    // false), so it reaches grid_index[INT_MIN] and segfaults. It also drives
+    // the WMP low-E curvefit, whose basis starts at 1/E, straight to NaN.
+    // Kill the particle -- a zero-energy neutron cannot be transported -- and
+    // report it, because unlike the case above this always indicates a bug.
+    static std::atomic<int> n_bad {0};
+    int k = n_bad++;
+    if (k < 10) {
+      warning(fmt::format("non-transportable neutron energy E={:.17g} "
+                          "(finite={}) in material {} after mt={}: killed",
+        E_, std::isfinite(E_), id_, p.event_mt()));
+    }
+    p.wgt() = 0.0; // alive() is derived from wgt_
+    return;
+  }
 
   // Determine if this material has S(a,b) tables
   bool check_sab = (thermal_tables_.size() > 0);

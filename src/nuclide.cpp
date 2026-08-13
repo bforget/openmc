@@ -2,6 +2,8 @@
 
 #include "openmc/nuclide.h"
 
+#include <atomic>
+
 #include "openmc/wmp_profile.h"
 
 #include <cstdlib> // for getenv (WMP_FAST_ONLY gate)
@@ -624,6 +626,25 @@ void Nuclide::calculate_elastic_xs(Particle& p) const
 {
   // Get temperature index, grid index, and interpolation factor
   auto& micro {p.neutron_xs(index_)};
+
+  // LAZY ELASTIC in the fast segment: calculate_xs() left the sentinel
+  // because the flight never needed elastic, so split it out of the POLES
+  // now. Reading the ACE table here instead would be cheaper (the grid
+  // index is already available) but wrong in kind: total would come from
+  // poles and elastic from ACE, and OpenMC infers inelastic as
+  // total - elastic - absorption, so our ~1-2% fast-range fit error would
+  // surface as spurious or suppressed inelastic scattering. This also keeps
+  // the deferred grid index (see lazy_grid in calculate_xs) deferred.
+  // WMP_NO_FAST must gate this too: with the fast range forced onto ACE the
+  // flight's total/absorption are tabulated, so taking elastic from the poles
+  // would mix sources within a single lookup.
+  static const bool no_fast_el = std::getenv("WMP_NO_FAST") != nullptr;
+  if (!no_fast_el && mp_fast_present_ && p.E() > mp_E_max_ &&
+      p.E() <= mp_fast_E_max_) {
+    micro.elastic = multipole_->evaluate_fast_elastic(p.E());
+    return;
+  }
+
   int i_temp = micro.index_temp;
   int i_grid = micro.index_grid;
   double f = micro.interp_factor;
@@ -699,6 +720,28 @@ void Nuclide::calculate_xs(
     // Call multipole kernel
     double sig_s, sig_a, sig_f;
     std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(p.E(), p.sqrtkT());
+
+    // WMP SANITY CHECK (set WMP_CHECK=1). A negative or NaN total gives a
+    // negative/NaN distance to collision, which surfaces far away as
+    // "negative distance to a lattice boundary" -- a geometry message for a
+    // cross-section fault. Report the nuclide and energy where it actually
+    // happens, capped so a bad library cannot flood the log.
+    static const bool wmp_check = std::getenv("WMP_CHECK") != nullptr;
+    if (wmp_check) {
+      double tot = sig_s + sig_a;
+      // Report only what the clamp had to rescue: a non-positive total.
+      bool bad = !(tot > 0.0);
+      if (bad) {
+        static std::atomic<int> n_reported {0};
+        int k = n_reported++;
+        if (k < 25) {
+          warning(fmt::format(
+            "WMP {} at E={:.8e} eV sqrtkT={:.6e}: total={:.6e} elastic={:.6e} "
+            "absorption={:.6e} fission={:.6e}",
+            name_, p.E(), p.sqrtkT(), tot, sig_s, sig_a, sig_f));
+        }
+      }
+    }
 
     micro.total = sig_s + sig_a;
     micro.elastic = sig_s;
@@ -789,7 +832,14 @@ void Nuclide::calculate_xs(
 
     // Fast-segment multipole? The transport cross sections come from the
     // T=0 pole sums instead of the tabulated grids.
-    bool use_fast_mp =
+    // WMP_NO_FAST=1: force the FAST range onto the tabulated (ACE) path so
+    // only lowE+resolved use poles. Exact complement of WMP_FAST_ONLY (which
+    // clears use_mp above), letting the two segments be attributed
+    // separately in k and in runtime. Like WMP_FAST_ONLY this CHANGES the
+    // cross sections, so the random walk diverges -- valid for attribution,
+    // not for reproducing a specific crash.
+    static const bool no_fast = std::getenv("WMP_NO_FAST") != nullptr;
+    bool use_fast_mp = !no_fast &&
       mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
 
     // LAZY GRID INDEXING: a fast-multipole lookup whose transport xs come
@@ -917,11 +967,19 @@ void Nuclide::calculate_xs(
     // these pole values (see the pole_base gate there).
     if (use_fast_mp) {
       prof_cat = WPROF_FLIGHT_FAST;
-      double sig_t, sig_s, sig_a, sig_f;
-      std::tie(sig_t, sig_s, sig_a, sig_f) =
-        multipole_->evaluate_fast(p.E());
+      double sig_t, sig_a, sig_f;
+      std::tie(sig_t, sig_a, sig_f) = multipole_->evaluate_fast(p.E());
       micro.total = sig_t;
-      micro.elastic = sig_s;
+      // LAZY ELASTIC. The flight needs total/absorption/fission only --
+      // elastic is not needed until a collision samples a channel -- so the
+      // fast segment sums elastic into its scatter group and leaves the
+      // sentinel here. calculate_elastic_xs() splits it back out from the
+      // POLES on demand (not from ACE: mixing sources would turn our fast
+      // fit error into spurious inelastic events, since OpenMC derives
+      // inelastic as total - elastic - absorption). Anything reading
+      // micro.elastic before a collision must resolve it first --
+      // calculate_urr_xs does, and it is the only such site.
+      micro.elastic = CACHE_INVALID;
       micro.absorption = sig_a;
       micro.fission = sig_f;
       micro.nu_fission =
@@ -975,7 +1033,7 @@ void Nuclide::calculate_xs(
   wmp_prof_add(prof_cat, prof_t0);
 }
 
-void Nuclide::ensure_grid_index(Particle& p)
+void Nuclide::ensure_grid_index(Particle& p) const
 {
   // Compute the ACE energy-grid index if it was deferred (lazy grid
   // indexing, see calculate_xs). Called at collision time for the sampled
@@ -1149,14 +1207,34 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
   // the grid index can be deferred to collision (see lazy grid in
   // calculate_xs). Verified vs NJOY MT4: median 1-3% (fit error on a channel
   // that is a small fraction of the total). Otherwise read tabulated MT4.
+  // WMP_URR_ACE=1 forces the URR treatment to match the tabulated path
+  // exactly: tabulated MT4 for the smooth inelastic, and the tabulated
+  // elastic as the LSSF=1 smooth base. BOTH shortcuts below are gated on
+  // multipole data being LOADED rather than USED, so they fire even when the
+  // segment flags have forced every cross section onto ACE. This flag
+  // isolates how much of the WMP-vs-ACE k bias comes from them.
+  static const bool urr_ace = std::getenv("WMP_URR_ACE") != nullptr;
   double inelastic = 0.;
-  bool pole_inel =
+  bool pole_inel = !urr_ace &&
     mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
   if (pole_inel) {
+    // total - elastic - absorption IS the pole other-scatter group, but the
+    // lazy split folded elastic INTO scatter, so the difference is only
+    // meaningful once elastic has been resolved. This is the one place the
+    // flight path must pay for the split, and it is confined to the URR band
+    // of URR nuclides (U-238: 20-149 keV, where MT51 opens at 45 keV).
+    if (micro.elastic == CACHE_INVALID)
+      calculate_elastic_xs(p);
     inelastic = micro.total - micro.elastic - micro.absorption;
     if (inelastic < 0.)
       inelastic = 0.;
-  } else if (urr.inelastic_flag_ != C_NONE) {
+  } else if (urr.inelastic_flag_ != C_NONE && urr_inelastic_ != C_NONE) {
+    // The fast-multipole flight path DEFERS the ACE grid index (lazy_grid in
+    // calculate_xs), leaving index_grid = C_NONE. Reading the tabulated MT4
+    // with that sentinel would index the reaction array at a negative offset,
+    // so force the search here.
+    ensure_grid_index(p);
+
     // get interpolation factor
     f = micro.interp_factor;
 
@@ -1175,9 +1253,11 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
   // pole-evaluated base — exactly the File 3 data the ptables are factors
   // of — so do not clobber micro.elastic with the tabulated value.
   if (urr.multiply_smooth_) {
-    bool pole_base =
+    bool pole_base = !urr_ace &&
       mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
-    if (!pole_base) {
+    // CACHE_INVALID is -1.0, so an unresolved elastic here would SIGN-FLIP
+    // the band factor rather than fail loudly. Resolve it either way.
+    if (!pole_base || micro.elastic == CACHE_INVALID) {
       calculate_elastic_xs(p);
     }
     elastic *= micro.elastic;

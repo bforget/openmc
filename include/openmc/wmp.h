@@ -5,6 +5,7 @@
 #include "openmc/tensor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <complex>
 #include <string>
 #include <tuple>
@@ -56,6 +57,12 @@ public:
   //! Read the fast segment and build the collapsed transport residues.
   void read_fast_segment(hid_t group);
 
+  //! Read the LOW-ENERGY segment: a curvefit-only region below the resolved
+  //! range, carrying no poles at all. Its basis is the same E^(i/2-1) one the
+  //! window curvefits use, so broaden_wmp_polynomials broadens it exactly
+  //! (image kernel included) and it needs no low-E correction.
+  void read_lowe_segment(hid_t group);
+
   // Methods
 
   //! \brief Evaluate the windowed multipole equations for cross sections in the
@@ -87,9 +94,8 @@ public:
     int n_win = static_cast<int>(win_.size());
     int i;
     if (grid_uniform_) {
-      i = (sqrtE < grid_u_lowe_)
-            ? 0
-            : 1 + static_cast<int>((sqrtE - grid_u_lowe_) * grid_inv_spacing_);
+      // window 0 is the first mesh window; see evaluate()
+      i = static_cast<int>((sqrtE - grid_u_lowe_) * grid_inv_spacing_);
       i = std::min(std::max(i, 0), n_win - 1);
     } else {
       int cell = static_cast<int>((sqrtE - win_u_lo_) * cell_inv_du_);
@@ -119,13 +125,34 @@ public:
   //! \brief Evaluate the fast-segment (URR+fast) pole representation.
   //!
   //! T=0 pole sum over all fitted channels, collapsed at load time to the
-  //! four transport quantities; threshold clamps honored (channels that
-  //! turn on/off inside a window are evaluated individually and gated).
+  //! transport quantities the FLIGHT needs; threshold clamps honored
+  //! (channels that turn on/off inside a window are evaluated individually
+  //! and gated).
+  //!
+  //! ELASTIC IS NOT RETURNED. The flight kernel needs only three independent
+  //! numbers -- total, absorption, fission -- so elastic and other-scatter
+  //! are summed into ONE "scatter" group at load time (see fast_merge_sct_),
+  //! dropping a residue pair per pole. Elastic is split back out only when a
+  //! collision actually samples a channel, via evaluate_fast_elastic().
   //!
   //! \param E Incident neutron energy in [eV], seam < E <= fast_E_max_
-  //! \return Tuple of total, elastic scattering, absorption (fission +
-  //!         disappearance), and fission cross sections in [b]
-  std::tuple<double, double, double, double> evaluate_fast(double E) const;
+  //! \return Tuple of total, absorption (fission + disappearance), and
+  //!         fission cross sections in [b]
+  std::tuple<double, double, double> evaluate_fast(double E) const;
+
+  //! \brief Elastic (MT2) alone in the fast segment -- the LAZY half of
+  //!        evaluate_fast, resolved on demand at a collision.
+  //!
+  //! Rebuilt from the per-channel residues (fw_chan_res_, which the collision
+  //! kernel already keeps in full) plus the elastic-only curvefit slot, so it
+  //! needs no storage the library did not already carry. Taking elastic from
+  //! the ACE table instead would mix sources -- total from poles, elastic
+  //! from ACE -- and turn our fast-range fit error into spurious inelastic
+  //! events, since OpenMC derives inelastic as total - elastic - absorption.
+  //!
+  //! \param E Incident neutron energy in [eV], seam < E <= fast_E_max_
+  //! \return Elastic scattering cross section in [b]
+  double evaluate_fast_elastic(double E) const;
 
   //! \brief Evaluate every fitted fast channel at E (collision kernel).
   //!
@@ -147,6 +174,7 @@ public:
   struct FastChanCtx {
     int k0;          //!< first flattened pole of the window
     int np;          //!< number of active poles
+    int w;           //!< window index, for the per-MT curvefit background
     double pr[96];   //!< Re of pole reciprocals 1/(u - p)
     double pi[96];   //!< Im of pole reciprocals
   };
@@ -160,6 +188,23 @@ public:
     double s = 0.0;
     for (int k = 0; k < ctx.np; ++k)
       s += cr[k].real() * ctx.pr[k] - cr[k].imag() * ctx.pi[k];
+    // PER-MT CURVEFIT BACKGROUND -- REQUIRED, not an refinement. v3 replaced
+    // the fast external poles with a per-window curvefit that carries most of
+    // the fast-range magnitude (87% of U-238's fast bytes). A pole-only
+    // channel value is therefore far too small, while scatter()'s cutoff is
+    // normalised on poles+curvefit; the selection walk then under-accumulates
+    // and falls through to the LAST inelastic level. Measured 2026-08-13:
+    // that alone was ~+390 pcm on coreI.
+    if (fast_cf_n_ > 0 && !fw_chan_cf_.empty()) {
+      const double* cf =
+        &fw_chan_cf_[((size_t)ctx.w * fast_cf_n_) * fast_n_mts_ + c];
+      const double sqrtE = std::sqrt(E);
+      double fac = 1.0 / E;
+      for (int k = 0; k < fast_cf_n_; ++k, cf += fast_n_mts_) {
+        s += *cf * fac;
+        fac *= sqrtE;
+      }
+    }
     return (s > 0.0) ? s : 0.0;
   }
 
@@ -171,6 +216,55 @@ public:
 
   // Data members
   std::string name_;               //!< Name of nuclide
+  //! LOW-ENERGY segment (optional). Below lowe_E_max_ the cross section is
+  //! this curvefit ALONE -- no poles -- which is why it is a segment in its
+  //! own right rather than window 0 of the resolved mesh (Ben, 2026-08-13).
+  //! Per-MT data kept alongside the collapsed triplet: the flight kernel
+  //! only needs (scatter, absorption, fission), but tallies and collision
+  //! sampling want the individual channels (Ben, 2026-08-13).
+  vector<int> mts_;                              //!< resolved channel MTs
+  tensor::Tensor<std::complex<double>> res_mt_;  //!< (n_pool, n_ch)
+  tensor::Tensor<double> cf_mt_;                 //!< (n_win, n_cf, n_ch)
+
+  //! Fast-segment per-window curvefit, collapsed to four slots and
+  //! interleaved per window. When fast_merge_sct_ the slot order is
+  //! [scatter=elastic+other, fission, disappearance, ELASTIC-ONLY]: the
+  //! flight reads slots 0..2 and evaluate_fast_elastic() reads slot 3, so
+  //! the lazy split costs no extra array. Otherwise (dormant rewindowed
+  //! path) it is the historical [elastic, fission, disappearance, other].
+  //! Fast curvefit, INTERLEAVED into the same per-window block as the poles.
+  //! A separate array is a second cache-line stream for every fast lookup,
+  //! which costs most in the SPARSE windows -- U-238 averages 0.57
+  //! poles/window, so its pole block is one line and the curvefit was a
+  //! second. Contiguity is the only thing that has ever improved this
+  //! evaluator's runtime, so the curvefit now sits at the FRONT of the
+  //! window's block, exactly as the resolved path does.
+  //!   block(w) = [4 * fast_cf_n_ curvefit][fast_soa_stride_ * np poles]
+  int fast_cf_n_ {0};
+  vector<size_t> fast_blk_off_;     //!< block start per window
+  vector<uint8_t> fast_has_part_;   //!< 1 if the window has partial channels
+  vector<double> fast_cf_tmp_;      //!< load-time only, freed after interleave
+
+  //! LAZY ELASTIC. The flight needs total/absorption/fission only; elastic is
+  //! needed just when a collision samples a channel. Summing elastic and
+  //! other-scatter into one group drops a residue PAIR from every pole:
+  //! stride 8->6 for the 25 non-fissionable nuclides and 10->8 for U-235/238,
+  //! 24.8% off the fast pole block, which matters because this evaluator is
+  //! memory-bound. Disabled for the rewindowed flight path (fl_*), whose
+  //! blocks are built against the historical four-group slot order.
+  bool fast_merge_sct_ {false};
+  int fast_ch_el_ {-1};             //!< channel index of MT2, -1 if not fit
+
+  int n_ext_ {0};   //!< externals per window; 0 for every v3 library
+  int n_win_ {0};   //!< resolved window count
+
+  bool lowe_present_ {false};
+  double lowe_E_min_ {0.0};        //!< Lower bound of the low-E segment [eV]
+  double lowe_E_max_ {0.0};        //!< Upper bound of the low-E segment [eV]
+  int lowe_n_ {0};                 //!< Number of curvefit terms
+  //! [n_cf][3] collapsed to the transport triplet (scatter, absorb, fission)
+  vector<double> lowe_cf_;
+
   double E_min_;                   //!< Minimum energy in [eV]
   double E_max_;                   //!< Maximum energy in [eV]
   double sqrt_awr_;                //!< Square root of atomic weight ratio
@@ -214,6 +308,13 @@ public:
   bool grid_uniform_ {false};
   double grid_u_lowe_ {0.0};
   double grid_inv_spacing_ {0.0};
+
+  //! (A DYADIC index lived here until 2026-08-13. v3 measured a dyadic mesh
+  //! against a uniform one on Cr-50 and U-238 and it LOST on the
+  //! 1/E-flux-weighted cost metric: refinement is driven by poles per window,
+  //! so it coarsens exactly the low-energy region carrying most of the flux.
+  //! Every library v3 produces is uniform, so the extra branch was removed
+  //! from evaluate() and prefetch().)
   vector<int> cell_first_;       //!< First window overlapping each grid cell
   double cell_inv_du_ {0.0};     //!< 1 / coarse-cell width in sqrt(E)
 
@@ -349,6 +450,11 @@ public:
   // channel], flat_pole in the same order as fw_data_ (pool poles then the 4
   // externals per window). fast_mts_ gives the MT of each channel; the clamps
   // gate each channel to [on, off].
+  //! Per-MT curvefit for the collision kernel, [n_win][fast_cf_n_][n_mts].
+  //! The flight collapses the curvefit into four transport groups; channel
+  //! selection needs it per MT, exactly as fw_chan_res_ keeps the residues.
+  //! Cold: touched only at collisions.
+  vector<double> fw_chan_cf_;
   int fast_n_mts_ {0};
   vector<int> fast_mts_;                       //!< MT number per channel
   vector<double> fast_mt_on_;                  //!< Per-channel turn-on [eV]

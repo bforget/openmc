@@ -40,6 +40,12 @@ WindowedMultipole::WindowedMultipole(hid_t group)
     if (object_exists(group, "fast")) {
       read_fast_segment(open_group(group, "fast"));
     }
+    // LOW-ENERGY segment: its own group, its own [E_min, E_max], no poles.
+    // Kept separate rather than folded in as resolved window 0 so each
+    // segment's bounds mean what they say (Ben, 2026-08-13).
+    if (object_exists(group, "lowe")) {
+      read_lowe_segment(open_group(group, "lowe"));
+    }
     return;
   }
 
@@ -107,6 +113,51 @@ WindowedMultipole::WindowedMultipole(hid_t group)
   }
 }
 
+//! Transport kind of a channel: 3 elastic, 1 fission, 2 disappearance,
+//! 0 other (MT5, inelastic -- treated as scatter). Collapsing BY MT rather
+//! than by column position is what lets v3's wider channel sets work; see
+//! read_global_segment.
+static int wmp_channel_kind(int mt)
+{
+  if (mt == 2)
+    return 3;
+  if (mt == 18)
+    return 1;
+  if (mt == 101 || (mt >= 102 && mt <= 117))
+    return 2;
+  return 0;
+}
+
+//! Read the LOW-ENERGY segment: curvefit only, no poles.
+void WindowedMultipole::read_lowe_segment(hid_t group)
+{
+  tensor::Tensor<double> cf; // [n_cf, n_ch]
+  read_dataset(group, "curvefit", cf);
+  tensor::Tensor<int64_t> mts_ds;
+  read_dataset(group, "mts", mts_ds);
+  read_dataset(group, "E_min", lowe_E_min_);
+  read_dataset(group, "E_max", lowe_E_max_);
+  int n_cf = cf.shape(0), n_ch = cf.shape(1);
+  lowe_n_ = n_cf;
+  lowe_cf_.assign((size_t)n_cf * 3, 0.0);
+  for (int k = 0; k < n_cf; ++k) {
+    double vs = 0.0, va = 0.0, vf = 0.0;
+    for (int c = 0; c < n_ch && c < mts_ds.shape(0); ++c) {
+      const double v = cf(k, c);
+      switch (wmp_channel_kind(static_cast<int>(mts_ds[c]))) {
+      case 3: vs += v; break;
+      case 1: vf += v; va += v; break;
+      case 2: va += v; break;
+      default: vs += v; break;
+      }
+    }
+    lowe_cf_[3 * k + 0] = vs;
+    lowe_cf_[3 * k + 1] = va;
+    lowe_cf_[3 * k + 2] = vf;
+  }
+  lowe_present_ = true;
+}
+
 void WindowedMultipole::read_global_segment(hid_t group)
 {
     global_format_ = true;
@@ -115,26 +166,60 @@ void WindowedMultipole::read_global_segment(hid_t group)
     read_dataset(group, "E_max", E_max_);
 
     tensor::Tensor<std::complex<double>> poles;    // (n_pool,)
-    tensor::Tensor<std::complex<double>> residues; // (n_pool, 3): s, f, g
+    tensor::Tensor<std::complex<double>> residues; // (n_pool, n_ch)
     read_dataset(group, "poles", poles);
     read_dataset(group, "residues", residues);
-    fissionable_ = true; // [MT2, MT18, MT102] layout
-    if (residues.shape(1) == 2)
-      fissionable_ = false; // [MT2, MT102]
+
+    // COLLAPSE BY MT, NOT BY POSITION. This used to assume the channel set
+    // was [MT2, MT18, MT102] when it had 3 columns and [MT2, MT102]
+    // otherwise. v3 libraries carry wider sets -- U-235 is
+    // [2, 18, 5, 102, 107] and B-10 is [2, 102, 103, 105, 107] -- and under
+    // the old rule U-235 was marked NON-FISSIONABLE (5 != 3) and B-10's
+    // absorption kept only MT102, dropping the (n,alpha) that is essentially
+    // all of it. Both are central to a borated-water core.
+    //
+    // The per-MT arrays are KEPT (res_mt_, mts_): the triplet is only what
+    // the FLIGHT kernel needs, while tallies and collision sampling still
+    // want the individual channels (Ben, 2026-08-13).
+    tensor::Tensor<int64_t> mts_ds;
+    read_dataset(group, "mts", mts_ds);
+    int n_ch = residues.shape(1);
+    mts_.assign(n_ch, 0);
+    for (int c = 0; c < n_ch && c < mts_ds.shape(0); ++c)
+      mts_[c] = static_cast<int>(mts_ds[c]);
+    // kind: 3 elastic, 1 fission, 2 disappearance, 0 other (MT5, inelastic)
+    vector<int> kind(n_ch, 0);
+    fissionable_ = false;
+    for (int c = 0; c < n_ch; ++c) {
+      int mt = mts_[c];
+      if (mt == 2) {
+        kind[c] = 3;
+      } else if (mt == 18) {
+        kind[c] = 1;
+        fissionable_ = true;
+      } else if (mt == 101 || (mt >= 102 && mt <= 117)) {
+        kind[c] = 2;
+      }
+    }
 
     int n_pool = poles.shape(0);
+    res_mt_ = residues;                       // keep per-MT for tallies
     gdata_ = tensor::Tensor<std::complex<double>>({(size_t)n_pool, 4});
     for (int i = 0; i < n_pool; ++i) {
       gdata_(i, MP_EA) = poles[i];
-      if (fissionable_) {
-        gdata_(i, MP_RS) = residues(i, 0);              // MT2
-        gdata_(i, MP_RA) = residues(i, 1) + residues(i, 2); // MT18 + MT102
-        gdata_(i, MP_RF) = residues(i, 1);              // MT18
-      } else {
-        gdata_(i, MP_RS) = residues(i, 0);
-        gdata_(i, MP_RA) = residues(i, 1);
-        gdata_(i, MP_RF) = 0.0;
+      std::complex<double> rs {0.0, 0.0}, ra {0.0, 0.0}, rf {0.0, 0.0};
+      for (int c = 0; c < n_ch; ++c) {
+        const std::complex<double> v = residues(i, c);
+        switch (kind[c]) {
+        case 3: rs += v; break;               // elastic
+        case 1: rf += v; ra += v; break;      // fission counts in absorption
+        case 2: ra += v; break;               // disappearance
+        default: rs += v; break;              // MT5 / inelastic: scatter-like
+        }
       }
+      gdata_(i, MP_RS) = rs;
+      gdata_(i, MP_RA) = ra;
+      gdata_(i, MP_RF) = rf;
     }
 
     tensor::Tensor<int64_t> wstart, wend;
@@ -165,6 +250,13 @@ void WindowedMultipole::read_global_segment(hid_t group)
         grid_inv_spacing_ = 1.0 / sp;
       }
     }
+
+    // (The DYADIC grid was removed 2026-08-13. v3 measured it against a
+    // uniform mesh on Cr-50 and U-238 and it LOST on the 1/E-flux-weighted
+    // cost metric -- refinement is driven by poles per window, so it coarsens
+    // exactly the low-energy region that carries most of the flux. Every
+    // library we produce is uniform, so the branch was dead weight in the
+    // hottest loop in the code.)
 
     // Build the two-level O(1) window index (see wmp.h)
     {
@@ -210,6 +302,10 @@ void WindowedMultipole::read_global_segment(hid_t group)
     } else {
       ext_data_ = tensor::Tensor<std::complex<double>>({(size_t)n_win, 0, 4});
     }
+    n_ext_ = (int)ext_data_.shape(1);
+    n_win_ = (int)win_start_.size();
+    {
+    }
 
     // Build the branch-free SoA pool arrays (see wmp.h). The 1/v pole
     // (Re p == 0) is broadening-invariant and must NOT go through zpf8h:
@@ -254,16 +350,27 @@ void WindowedMultipole::read_global_segment(hid_t group)
       // flat arrays meant three scattered lines per lookup; one window's
       // block is 3*cf_n_ doubles (120 B at cf_n_=5) = 2 lines, prefetched.
       cf_blk_.assign((size_t)n_cw * nc * cf_ch_, 0.0);
+      // Collapsed BY MT with the same `kind` map as the residues above --
+      // positional collapse silently mis-assigned every channel set wider
+      // than 3 (see the residue block).
+      cf_mt_ = cf;                            // keep per-MT for tallies
       for (int w = 0; w < n_cw; ++w) {
         for (int k = 0; k < nc; ++k) {
           double* d = &cf_blk_[((size_t)w * nc + k) * cf_ch_];
-          d[0] = cf(w, k, 0);
-          if (nch == 3) {
-            d[1] = cf(w, k, 1) + cf(w, k, 2); // MT18 + MT102
-            d[2] = cf(w, k, 1);               // MT18 (fissionable only)
-          } else {
-            d[1] = cf(w, k, 1);               // MT102
+          double vs = 0.0, va = 0.0, vf = 0.0;
+          for (int c = 0; c < nch && c < (int)kind.size(); ++c) {
+            const double v = cf(w, k, c);
+            switch (kind[c]) {
+            case 3: vs += v; break;
+            case 1: vf += v; va += v; break;
+            case 2: va += v; break;
+            default: vs += v; break;
+            }
           }
+          d[0] = vs;
+          d[1] = va;
+          if (cf_ch_ > 2)
+            d[2] = vf;
         }
       }
     }
@@ -352,6 +459,12 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   int n_ext = xp.shape(1);
   fast_bounds_.assign(bounds.begin(), bounds.end());
 
+  // LAZY ELASTIC (see wmp.h fast_merge_sct_): fold elastic into the
+  // scatter group for the flight and recover it on demand at collisions.
+  // The rewindowed flight path builds its blocks against the historical
+  // four-group order, so it keeps the unmerged layout.
+  fast_merge_sct_ = !object_exists(group, "flight_bounds");
+
   // Transport kind of each channel: 0 other-scatter (inelastic, (n,xn),
   // MT5, ...), 1 fission, 2 disappearance lump, 3 elastic.
   vector<int> kind(n_mts, 0);
@@ -369,8 +482,58 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   // Flatten each window's pointer range + externals; collapse residues of
   // fully-active channels into the four transport vectors, keep channels
   // that turn on/off inside the window as individually-clamped partials.
+  // PER-WINDOW CURVEFIT for the fast segment. v3 replaces the 4 external
+  // poles with an ncf-term curvefit fitted to the externals' own
+  // contribution on a self-generated grid -- the externals stored COMPLEX
+  // residues (4*nch*16 B), the curvefit stores REAL coefficients
+  // (ncf*nch*8 B), halving the background term, which dominated the smooth
+  // nuclides (U-238's externals were 87% of its fast bytes).
+  //
+  // The fast range is UNBROADENED, so the basis is simply E^(k/2 - 1) and
+  // needs no broaden_wmp_polynomials call. Collapsed into the same four
+  // channels the pole sweep uses (elastic / fission / disappearance / other).
+  if (object_exists(group, "curvefit")) {
+    tensor::Tensor<double> cf; // [n_win, n_cf, n_ch]
+    read_dataset(group, "curvefit", cf);
+    int ncw = cf.shape(0), nc = cf.shape(1), nch = cf.shape(2);
+    fast_cf_n_ = nc;
+    fast_cf_tmp_.assign((size_t)ncw * nc * 4, 0.0);
+    // PER-MT copy for the collision kernel. The collapse below is for the
+    // FLIGHT only; channel selection needs each MT's own background, exactly
+    // as fw_chan_res_ keeps each MT's residues (Ben, 2026-08-13: "combine at
+    // load for the flight, but keep everything separate for collision").
+    fw_chan_cf_.assign((size_t)ncw * nc * n_mts, 0.0);
+    for (int w = 0; w < ncw; ++w)
+      for (int k = 0; k < nc; ++k)
+        for (int c = 0; c < nch && c < n_mts; ++c)
+          fw_chan_cf_[((size_t)w * nc + k) * n_mts + c] = cf(w, k, c);
+    for (int w = 0; w < ncw; ++w) {
+      for (int k = 0; k < nc; ++k) {
+        double* d = &fast_cf_tmp_[((size_t)w * nc + k) * 4];
+        for (int c = 0; c < nch && c < n_mts; ++c) {
+          const double v = cf(w, k, c);
+          // Merged slot order is [scatter, fission, disappearance, ELASTIC];
+          // elastic lands in BOTH slot 0 (summed with other-scatter, for the
+          // flight) and slot 3 (alone, for evaluate_fast_elastic).
+          switch (kind[c]) {
+          case 3:
+            d[0] += v;                              // elastic -> scatter
+            if (fast_merge_sct_) d[3] += v;         // elastic-only copy
+            break;
+          case 1: d[1] += v; break;                 // fission
+          case 2: d[2] += v; break;                 // disappearance
+          default:
+            d[fast_merge_sct_ ? 0 : 3] += v;        // other (MT5, inelastic)
+            break;
+          }
+        }
+      }
+    }
+  }
+
   fw_off_.assign(n_win + 1, 0);
   fast_partials_.resize(n_win);
+  fast_has_part_.assign(n_win, 0);
   for (int w = 0; w < n_win; ++w) {
     int np = (wend[w] - wstart[w]) + n_ext;
     if (np > 96) {
@@ -398,6 +561,8 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     if (mts[c] >= 0 && mts[c] < 900)
       fast_mt_to_chan_[mts[c]] = c;
   }
+  // Elastic channel, cached for the lazy split (evaluate_fast_elastic).
+  fast_ch_el_ = fast_channel_of_mt(2);
   fw_chan_res_.assign((size_t)n_flat * n_mts, 0.0);
 
   for (int w = 0; w < n_win; ++w) {
@@ -457,6 +622,7 @@ void WindowedMultipole::read_fast_segment(hid_t group)
         for (int j = 0; j < n_ext; ++j)
           fp_res_.push_back(xr(w, j, c));
         fast_partials_[w].push_back(part);
+        fast_has_part_[w] = 1;
       }
     }
   }
@@ -501,18 +667,41 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     if (rec[3] != 0.0) fast_has_dis_ = true;
     if (rec[4] != 0.0) fast_has_oth_ = true;
   }
+  // With the lazy split, other-scatter no longer gets a slot of its own --
+  // it is summed into the elastic slot below, which then means SCATTER.
   const int nch = 1 + (int)fast_has_fis_ + (int)fast_has_dis_
-                    + (int)fast_has_oth_;
+                    + (int)(fast_has_oth_ && !fast_merge_sct_);
   fast_soa_stride_ = 2 + 2 * nch;
   if (std::getenv("WMP_FASTCH_DEBUG"))
-    std::fprintf(stderr, "[fastch] %-8s el%s%s%s -> stride %d/10 (%.0f%% of bytes)\n",
-      name_.c_str(), fast_has_fis_ ? "+fis" : "", fast_has_dis_ ? "+dis" : "",
-      fast_has_oth_ ? "+oth" : "", fast_soa_stride_, 100.0 * fast_soa_stride_ / 10.0);
-  fw_soa_.assign((size_t)fast_soa_stride_ * n_flat, 0.0);
+    std::fprintf(stderr,
+      "[fastch] %-8s %s%s%s -> stride %d/10 (%.0f%% of bytes)%s\n",
+      name_.c_str(),
+      (fast_merge_sct_ && fast_has_oth_) ? "sct(el+oth)" : "el",
+      fast_has_fis_ ? "+fis" : "", fast_has_dis_ ? "+dis" : "",
+      fast_soa_stride_, 100.0 * fast_soa_stride_ / 10.0,
+      fast_merge_sct_ ? "  [lazy elastic]" : "");
+  // One block per window: curvefit first, then the SoA pole run.
+  const int cfw = 4 * fast_cf_n_;
+  fast_blk_off_.assign(n_win + 1, 0);
+  {
+    size_t off = 0;
+    for (int w = 0; w < n_win; ++w) {
+      fast_blk_off_[w] = off;
+      off += (size_t)cfw
+             + (size_t)fast_soa_stride_ * (fw_off_[w + 1] - fw_off_[w]);
+    }
+    fast_blk_off_[n_win] = off;
+    fw_soa_.assign(off, 0.0);
+  }
   for (int w = 0; w < n_win; ++w) {
     int k0 = fw_off_[w];
     int np = fw_off_[w + 1] - k0;
-    double* B = &fw_soa_[(size_t)fast_soa_stride_ * k0];
+    if (cfw) {
+      double* d = &fw_soa_[fast_blk_off_[w]];
+      for (int i = 0; i < cfw; ++i)
+        d[i] = fast_cf_tmp_[(size_t)w * cfw + i];
+    }
+    double* B = &fw_soa_[fast_blk_off_[w] + cfw];
     for (int k = 0; k < np; ++k) {
       const std::complex<double>* rec = &fw_data_[(size_t)(k0 + k) * FW_STRIDE];
       double a = rec[0].real(), b = rec[0].imag();
@@ -523,13 +712,25 @@ void WindowedMultipole::read_fast_segment(hid_t group)
         if ((g == 1 && !fast_has_fis_) || (g == 2 && !fast_has_dis_)
             || (g == 3 && !fast_has_oth_))
           continue;
-        double rr = rec[1 + g].real(), ri = rec[1 + g].imag();
+        // LAZY SPLIT: other-scatter (g == 3) is summed into the elastic slot
+        // instead of taking one of its own, so slot 0 holds SCATTER. Doing it
+        // on the residues here -- rather than on the two numerators below --
+        // is what removes the pair; the numerator form is affine in the
+        // residue, so the sum of numerators equals the numerator of the sum.
+        if (g == 3 && fast_merge_sct_)
+          continue;
+        std::complex<double> res = rec[1 + g];
+        if (g == 0 && fast_merge_sct_ && fast_has_oth_)
+          res += rec[4];
+        double rr = res.real(), ri = res.imag();
         B[(2 + 2 * slot) * np + k] = rr;
         B[(3 + 2 * slot) * np + k] = -(rr * a + ri * b);
         ++slot;
       }
     }
-  }
+  }  fast_cf_tmp_.clear();
+  fast_cf_tmp_.shrink_to_fit();
+
 
   // ---- rewindowed FLIGHT path (optional; see wmp.h FlWin) ----------------
   // Libraries without the flight_* datasets keep the full-pole sweep above.
@@ -741,9 +942,19 @@ static inline const double* fl_poles(const double* B, int order)
   return B + order * NC;
 }
 
-std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
+std::tuple<double, double, double> WindowedMultipole::evaluate_fast(
   double E) const
 {
+  // DEFENSIVE FLOOR. The low-E curvefit basis starts at 1/E, so E == 0 (or a
+  // NaN arriving from a bad collision) turns every channel into NaN, which
+  // then defeats both bounds checks in Nuclide::calculate_xs and segfaults.
+  // Transport now kills such particles in Material::calculate_neutron_xs, but
+  // this path is also reachable from tallies and the C API. Small POSITIVE
+  // energies are fine and are NOT clamped -- the 1/v extrapolation is exact
+  // down to at least 1e-11 eV (verified 2026-08-13).
+  if (!(E > 0.0))
+    E = (E_min_ > 0.0) ? E_min_ : 1.0e-11;
+
   double sqrtE = std::sqrt(E);
 
   if (fl_have_) {
@@ -804,9 +1015,9 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
       default: fl_eval<true,true,true>(B, fl_order_, np, sqrtE, t, el, fis, dis, oth);
         fast_sweep<true,true,true>(fl_poles<true,true,true>(B, fl_order_), np, sqrtE, el, fis, dis, oth); break;
       }
-      el = std::max(el, 0.0); fis = std::max(fis, 0.0);
-      dis = std::max(dis, 0.0); oth = std::max(oth, 0.0);
-      return {el + fis + dis + oth, el, dis + fis, fis};
+      el = (el > 0.0) ? el : 1.0e-5; fis = (fis > 0.0) ? fis : 0.0;
+      dis = (dis > 0.0) ? dis : 0.0; oth = (oth > 0.0) ? oth : 0.0;
+      return {el + fis + dis + oth, dis + fis, fis};
     }
     int w;
     if (use_loop) {
@@ -873,7 +1084,7 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
     fis = std::max(fis, 0.0);
     dis = std::max(dis, 0.0);
     oth = std::max(oth, 0.0);
-    return {el + fis + dis + oth, el, dis + fis, fis};
+    return {el + fis + dis + oth, dis + fis, fis};
   }
 
   // O(1) window lookup over the fast bounds
@@ -895,16 +1106,20 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
   // clamps) is computed from fw_data_ only when the window has partials.
   constexpr int FAST_MAX_ACTIVE = 96;
   std::complex<double> phi[FAST_MAX_ACTIVE];
-  bool need_phi = !fast_partials_[w].empty();
+  bool need_phi = fast_has_part_[w];   // flag, not a vector<> indirection
   double u = sqrtE;
-  const double* B = &fw_soa_[(size_t)fast_soa_stride_ * k0];
+  const double* BLK = &fw_soa_[fast_blk_off_[w]];
+  const double* B = BLK + 4 * fast_cf_n_;
   double el = 0.0, fis = 0.0, dis = 0.0, oth = 0.0;
   // One switch on a per-nuclide constant; each instantiation carries
   // COMPILE-TIME slot offsets and sweeps only the channels that exist.
   // All eight combinations are instantiated -- an unhandled one would read
   // the wrong slots and feed garbage cross sections to the transport loop.
+  // With the lazy split, slot 0 holds SCATTER (elastic + other) and there is
+  // no other-scatter slot, so the OTH instantiations are simply not selected
+  // -- `el` receives the merged scatter sum.
   int mask = (fast_has_fis_ ? 4 : 0) | (fast_has_dis_ ? 2 : 0)
-             | (fast_has_oth_ ? 1 : 0);
+             | ((fast_has_oth_ && !fast_merge_sct_) ? 1 : 0);
   switch (mask) {
   case 0: fast_sweep<false, false, false>(B, np, u, el, fis, dis, oth); break;
   case 1: fast_sweep<false, false, true>(B, np, u, el, fis, dis, oth); break;
@@ -943,18 +1158,111 @@ std::tuple<double, double, double, double> WindowedMultipole::evaluate_fast(
       dis += s;
       break;
     default:
-      oth += s;
+      // other-scatter joins the scatter group under the lazy split
+      if (fast_merge_sct_)
+        el += s;
+      else
+        oth += s;
+    }
+  }
+
+  // Per-window curvefit background (replaces the external poles). T = 0 in
+  // the fast range, so the basis factors are the plain E^(k/2 - 1).
+  if (fast_cf_n_ > 0) {
+    // Channels the nuclide does not have are skipped, matching fast_sweep's
+    // compile-time elimination -- accumulating into all four unconditionally
+    // wasted three FMAs per coefficient on an elastic-only nuclide.
+    const double* c = BLK;   // curvefit is at the FRONT of this block
+    double fac = 1.0 / E;
+    const bool hf = fast_has_fis_, hd = fast_has_dis_;
+    // Under the lazy split slot 0 is already elastic+other and slot 3 is the
+    // elastic-only copy that evaluate_fast_elastic reads -- the flight must
+    // NOT add it, or elastic would be counted twice.
+    const bool ho = fast_has_oth_ && !fast_merge_sct_;
+    for (int k = 0; k < fast_cf_n_; ++k, c += 4) {
+      el += c[0] * fac;
+      if (hf) fis += c[1] * fac;
+      if (hd) dis += c[2] * fac;
+      if (ho) oth += c[3] * fac;
+      fac *= sqrtE;
     }
   }
 
   // Clip tiny negative excursions from the fit (thresholds, near-zero xs)
-  el = std::max(el, 0.0);
-  fis = std::max(fis, 0.0);
-  dis = std::max(dis, 0.0);
-  oth = std::max(oth, 0.0);
+  el = (el > 0.0) ? el : 1.0e-5;  // floor, not clamp: see evaluate()
+  fis = (fis > 0.0) ? fis : 0.0;
+  dis = (dis > 0.0) ? dis : 0.0;
+  oth = (oth > 0.0) ? oth : 0.0;
 
   double total = el + fis + dis + oth;
-  return {total, el, dis + fis, fis};
+  return {total, dis + fis, fis};
+}
+
+//! Elastic alone, on demand. See wmp.h: the flight never computes this, so
+//! nothing here is on the hot path -- it runs once per collision that needs
+//! to sample a channel, and only in the fast segment.
+double WindowedMultipole::evaluate_fast_elastic(double E) const
+{
+  // DEFENSIVE FLOOR. The low-E curvefit basis starts at 1/E, so E == 0 (or a
+  // NaN arriving from a bad collision) turns every channel into NaN, which
+  // then defeats both bounds checks in Nuclide::calculate_xs and segfaults.
+  // Transport now kills such particles in Material::calculate_neutron_xs, but
+  // this path is also reachable from tallies and the C API. Small POSITIVE
+  // energies are fine and are NOT clamped -- the 1/v extrapolation is exact
+  // down to at least 1e-11 eV (verified 2026-08-13).
+  if (!(E > 0.0))
+    E = (E_min_ > 0.0) ? E_min_ : 1.0e-11;
+
+  // Unmerged (rewindowed) libraries never take the lazy path, but answer
+  // correctly anyway; a nuclide with no fitted MT2 has no elastic to give.
+  if (fast_ch_el_ < 0)
+    return 1.0e-5;
+
+  double sqrtE = std::sqrt(E);
+
+  // Same O(1) window lookup as evaluate_fast's full-sweep path.
+  int n_win = fw_off_.size() - 1;
+  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
+  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
+  int w = fast_cell_first_[cell];
+  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
+    ++w;
+
+  int k0 = fw_off_[w];
+  int np = fw_off_[w + 1] - k0;
+
+  // Pole sum over the MT2 column of the per-channel residues. This is the
+  // SAME data the collision kernel already uses (fast_chan_xs), so the split
+  // costs no extra storage -- but it is a different, COLD cache stream from
+  // the flight SoA, which is precisely why it is not done during the flight.
+  double s = 0.0;
+  const int c = fast_ch_el_;
+  if (E >= fast_mt_on_[c] && E <= fast_mt_off_[c]) {
+    const std::complex<double>* cr =
+      &fw_chan_res_[(size_t)k0 * fast_n_mts_ + (size_t)c * np];
+    const std::complex<double>* rec = &fw_data_[(size_t)k0 * FW_STRIDE];
+    for (int k = 0; k < np; ++k, rec += FW_STRIDE) {
+      double dr = sqrtE - rec[0].real(), di = -rec[0].imag();
+      double iv = 1.0 / (dr * dr + di * di);
+      // phi = 1/(u - p), same convention as the partial-channel clamps
+      s += cr[k].real() * (dr * iv) - cr[k].imag() * (-di * iv);
+    }
+  }
+
+  // Elastic-only curvefit: slot 3 when merged (slot 0 is elastic+other),
+  // slot 0 otherwise.
+  if (fast_cf_n_ > 0) {
+    const double* cf = &fw_soa_[fast_blk_off_[w]] + (fast_merge_sct_ ? 3 : 0);
+    double fac = 1.0 / E;
+    for (int k = 0; k < fast_cf_n_; ++k, cf += 4) {
+      s += *cf * fac;
+      fac *= sqrtE;
+    }
+  }
+
+  // Same floor as the flight's scatter group: a zero elastic would make
+  // collision channel selection divide by zero.
+  return (s > 0.0) ? s : 1.0e-5;
 }
 
 void WindowedMultipole::evaluate_fast_channels(double E, double* out) const
@@ -1015,6 +1323,7 @@ void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
   while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
     ++w;
 
+  ctx.w = w;
   ctx.k0 = fw_off_[w];
   ctx.np = fw_off_[w + 1] - ctx.k0;
 
@@ -1081,6 +1390,16 @@ static inline void pole_sweep(const double* pol, int np, double sqrtE,
 std::tuple<double, double, double> WindowedMultipole::evaluate(
   double E, double sqrtkT) const
 {
+  // DEFENSIVE FLOOR. The low-E curvefit basis starts at 1/E, so E == 0 (or a
+  // NaN arriving from a bad collision) turns every channel into NaN, which
+  // then defeats both bounds checks in Nuclide::calculate_xs and segfaults.
+  // Transport now kills such particles in Material::calculate_neutron_xs, but
+  // this path is also reachable from tallies and the C API. Small POSITIVE
+  // energies are fine and are NOT clamped -- the 1/v extrapolation is exact
+  // down to at least 1e-11 eV (verified 2026-08-13).
+  if (!(E > 0.0))
+    E = (E_min_ > 0.0) ? E_min_ : 1.0e-11;
+
   using namespace std::complex_literals;
 
   // ==========================================================================
@@ -1095,15 +1414,39 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
   // range + external poles, sigma-basis analytic broadening.
 
   if (global_format_) {
+    // LOW-ENERGY SEGMENT: curvefit alone, no poles. The basis broadens in
+    // closed form (image kernel included), so this is exact at temperature
+    // and needs no low-E correction.
+    // ONE compare, not a bool load AND a compare: lowe_E_max_ stays 0 when
+    // there is no low-E segment, so E < 0 is never true. This is the first
+    // test on every resolved lookup.
+    if (E < lowe_E_max_) {
+      array<double, MAX_POLY_COEFFICIENTS> fac;
+      if (sqrtkT > 0.0) {
+        broaden_wmp_polynomials(E, sqrt_awr_ / sqrtkT, lowe_n_, fac.data());
+      } else {
+        double t = invE;
+        for (int k = 0; k < lowe_n_; ++k) { fac[k] = t; t *= sqrtE; }
+      }
+      double s0 = 0.0, a0 = 0.0, f0 = 0.0;
+      for (int k = 0; k < lowe_n_; ++k) {
+        s0 += lowe_cf_[3 * k + 0] * fac[k];
+        a0 += lowe_cf_[3 * k + 1] * fac[k];
+        f0 += lowe_cf_[3 * k + 2] * fac[k];
+      }
+      return std::make_tuple(s0, a0, fissionable_ ? f0 : 0.0);
+    }
+
     // Variable-width windows: O(1) two-level index (uniform coarse grid in
     // sqrt(E) + short forward walk; see wmp.h)
     int n_win = win_start_.size();
     int i_window;
     if (grid_uniform_) {
       // ARITHMETIC ONLY -- no table, no scan, no dependent load
-      i_window = (sqrtE < grid_u_lowe_)
-        ? 0
-        : 1 + (int)((sqrtE - grid_u_lowe_) * grid_inv_spacing_);
+      // Window 0 is the FIRST MESH WINDOW. (It used to be a low-E slot, with
+      // the mesh at 1..N and a `1 +` here; the low-E region is now its own
+      // segment handled above, so the offset would be off by one.)
+      i_window = (int)((sqrtE - grid_u_lowe_) * grid_inv_spacing_);
       i_window = std::min(std::max(i_window, 0), n_win - 1);
     } else {
       int cell = (int)((sqrtE - win_u_lo_) * cell_inv_du_);
@@ -1114,7 +1457,10 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     }
 
     double sig_s = 0.0, sig_a = 0.0, sig_f = 0.0;
-    int n_ext = ext_data_.shape(1);
+    // n_ext_ is a MEMBER: ext_data_.shape(1) reads the tensor's shape vector
+    // off the heap on every lookup, to learn a per-nuclide constant that is
+    // ZERO for every v3 library (the curvefit replaced the externals).
+    const int n_ext = n_ext_;
 
     // xi = sqrt(kT/AWR) in sqrt(eV); sqrtkT = sqrt(kT)
     double xi = (sqrtkT > 0.0) ? sqrtkT / sqrt_awr_ : 0.0;
@@ -1266,14 +1612,53 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       // cf_blk_ was freed once the blocks were materialised at load.
       const double* c = blk;
       const int nch = cf_ch_;
-      for (int k = 0; k < cf_n_; ++k, c += nch) {
-        sig_s += c[0] * fac[k];
-        sig_a += c[1] * fac[k];
-        if (fissionable_)
+      // fissionable_ hoisted OUT of the loop: it is a per-nuclide constant,
+      // and testing it per coefficient per lookup is a branch in the hot path
+      // for nothing.
+      if (fissionable_) {
+        for (int k = 0; k < cf_n_; ++k, c += nch) {
+          sig_s += c[0] * fac[k];
+          sig_a += c[1] * fac[k];
           sig_f += c[2] * fac[k];
+        }
+      } else {
+        for (int k = 0; k < cf_n_; ++k, c += nch) {
+          sig_s += c[0] * fac[k];
+          sig_a += c[1] * fac[k];
+        }
       }
     }
 
+    // CLAMP. The fast path already clips its four channels; the resolved path
+    // did not, so a window whose fit dips below zero produced a NEGATIVE
+    // TOTAL, hence a negative distance to collision, surfacing far away as
+    // "negative distance to a lattice boundary". Ar-40 reached -47 b at
+    // 114 keV; several nuclides show harmless -1e-5 b excursions in capture.
+    //
+    // THIS HIDES A LIBRARY FAULT RATHER THAN FIXING IT (Ben, 2026-08-13:
+    // clamp "so that we can test the efficiency before chasing the culprit").
+    // Set WMP_CHECK=1 to report every clamp with nuclide and energy.
+    // NOTE THE FORM: std::max(NaN, 0.0) returns NaN -- it evaluates
+    // `NaN < 0.0` as false and hands back the first argument. A NaN then
+    // reaches the transport as a NaN energy, and `(int)NaN` is INT_MIN, which
+    // indexes the log-union grid out of bounds and segfaults in
+    // Nuclide::calculate_xs. `(x > 0.0) ? x : 0.0` traps NaN and negatives
+    // together.
+    // TEMPORARY FLOOR, NOT A FIX (Ben, 2026-08-13: "let's make it 1e-5
+    // instead of 0 and run the case, later we can go back and fix the
+    // libraries"). Clamping to exactly 0 was not enough: a ZERO micro total
+    // breaks collision sampling, which divides through it, and the resulting
+    // garbage energy makes `log(E)` -inf so `(int)` gives INT_MIN and
+    // Material::calculate_neutron_xs indexes grid_index[] out of bounds.
+    //
+    // Elastic carries the floor so the total is always > 0; the other
+    // channels clamp to zero. THREE LIBRARIES NEED REPAIR: Al-27, Cr-50 and
+    // Ar-40 evaluate non-positive somewhere (12, 6 and 140 points of an
+    // 80000-point sweep at 294 K). The non-negativity constraint was only
+    // ever applied to the RESOLVED phase-3 fit, never to the fast segment.
+    sig_s = (sig_s > 0.0) ? sig_s : 1.0e-5;
+    sig_a = (sig_a > 0.0) ? sig_a : 0.0;
+    sig_f = (sig_f > 0.0) ? sig_f : 0.0;
     return std::make_tuple(sig_s, sig_a, sig_f);
   }
 
@@ -1458,7 +1843,12 @@ void read_multipole_data(int i_nuclide)
   // calculate_xs need no dereference of the multipole object (see nuclide.h).
   nuc->mp_present_ = true;
   nuc->mp_fast_present_ = nuc->multipole_->fast_present_;
-  nuc->mp_E_min_ = nuc->multipole_->E_min_;
+  // The gate opens at the bottom of the LOW-E segment when one is present:
+  // E_min_ is the resolved segment's lower bound, which is the low-E seam.
+  nuc->mp_E_min_ = nuc->multipole_->lowe_present_
+                     ? std::min(nuc->multipole_->E_min_,
+                                nuc->multipole_->lowe_E_min_)
+                     : nuc->multipole_->E_min_;
   nuc->mp_E_max_ = nuc->multipole_->E_max_;
   nuc->mp_fast_E_max_ = nuc->multipole_->fast_E_max_;
   close_group(group);

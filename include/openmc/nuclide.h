@@ -59,7 +59,7 @@ public:
   //! Compute the ACE energy-grid index if it was deferred (lazy grid
   //! indexing). Call at collision time for the sampled nuclide.
   //! \param[in,out] p  Particle object
-  void ensure_grid_index(Particle& p);
+  void ensure_grid_index(Particle& p) const;
 
   //! Calculate thermal scattering cross section
   //
