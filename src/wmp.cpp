@@ -1434,6 +1434,17 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         a0 += lowe_cf_[3 * k + 1] * fac[k];
         f0 += lowe_cf_[3 * k + 2] * fac[k];
       }
+      // SAME FLOOR AS THE RESOLVED BRANCH. scatter() reaches the inelastic
+      // loop only when prob <= cutoff, and in the multipole path that loop
+      // indexes rx->xs(micro) with index_grid = -1 (the resolved path poisons
+      // it deliberately). prob = micro.elastic and cutoff = prn()*(total -
+      // absorption) = prn()*sig_s, so a ZERO sig_s makes prob > cutoff false
+      // and drops into that loop. Measured 2026-08-13: all 27 libraries are
+      // safely positive here (min 0.60 b, Fe-57), but leaving it unguarded
+      // makes correctness depend on the fit rather than on the code.
+      s0 = (s0 > 0.0) ? s0 : 1.0e-5;
+      a0 = (a0 > 0.0) ? a0 : 0.0;
+      f0 = (f0 > 0.0) ? f0 : 0.0;
       return std::make_tuple(s0, a0, fissionable_ ? f0 : 0.0);
     }
 
