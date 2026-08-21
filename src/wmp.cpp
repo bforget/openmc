@@ -474,7 +474,15 @@ void WindowedMultipole::read_fast_segment(hid_t group)
       kind[c] = 3;
     } else if (mt == 18) {
       kind[c] = 1;
-    } else if (mt == 101 || mt == 102 || mt == 103 || mt == 107) {
+    } else if (mt == 101 || (mt >= 102 && mt <= 117)) {
+      // FULL disappearance range, matching the resolved map above. This used
+      // to list only 101/102/103/107, so any other disappearance channel --
+      // MT104 (n,t), MT105 (n,d), MT106, MT108 ... -- fell through to
+      // kind 0 "other scatter" and was added to SCATTERING instead of
+      // absorption, silently. Harmless while the fast segment carried only
+      // the MT101 lump; a real defect from 2026-08-18, when disappearance
+      // reactions started being carried INDIVIDUALLY so depletion and tallies
+      // can resolve them (B-10 carries MT104 and MT105, B-11 carries MT105).
       kind[c] = 2;
     }
   }
@@ -510,7 +518,18 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     for (int w = 0; w < ncw; ++w) {
       for (int k = 0; k < nc; ++k) {
         double* d = &fast_cf_tmp_[((size_t)w * nc + k) * 4];
+        const double _elo = fast_bounds_[w] * fast_bounds_[w];
+        const double _ehi = fast_bounds_[w + 1] * fast_bounds_[w + 1];
         for (int c = 0; c < nch && c < n_mts; ++c) {
+          // PARTIAL CHANNELS ARE EXCLUDED, exactly as they are from the
+          // collapsed RESIDUES below. A channel whose clamp cuts inside this
+          // window has its POLES gated at evaluation; leaving its curvefit in
+          // the collapsed groups gated NOTHING and applied the background
+          // across the whole window. Ne-20 window 25 (13.79-20 MeV) holds
+          // MT16, which turns on at 17.91 MeV: the flight read 13% low below
+          // that and exactly right above it (2026-08-18).
+          if (!(e_on[c] <= _elo && e_off[c] >= _ehi))
+            continue;
           const double v = cf(w, k, c);
           // Merged slot order is [scatter, fission, disappearance, ELASTIC];
           // elastic lands in BOTH slot 0 (summed with other-scatter, for the
@@ -616,6 +635,7 @@ void WindowedMultipole::read_fast_segment(hid_t group)
         part.E_on = e_on[c];
         part.E_off = e_off[c];
         part.kind = kind[c];
+        part.ch = c;
         part.res_off = (int)fp_res_.size();
         for (int k = 0; k < np; ++k)
           fp_res_.push_back(residues(wstart[w] + k, c));
@@ -1147,6 +1167,16 @@ std::tuple<double, double, double> WindowedMultipole::evaluate_fast(
     for (int k = 0; k < np; ++k)
       s += fp_res_[part.res_off + k].real() * phi[k].real() -
            fp_res_[part.res_off + k].imag() * phi[k].imag();
+    // ...and this channel's OWN curvefit, which the collapsed groups omit.
+    if (fast_cf_n_ > 0 && !fw_chan_cf_.empty() && part.ch >= 0) {
+      const double* cfp =
+        &fw_chan_cf_[((size_t)w * fast_cf_n_) * fast_n_mts_ + part.ch];
+      double fac = 1.0 / E;
+      for (int k = 0; k < fast_cf_n_; ++k, cfp += fast_n_mts_) {
+        s += *cfp * fac;
+        fac *= sqrtE;
+      }
+    }
     switch (part.kind) {
     case 3:
       el += s;

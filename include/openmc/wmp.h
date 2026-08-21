@@ -365,6 +365,7 @@ public:
     double E_off; //!< Clamp: zero above this energy [eV]
     int kind;     //!< 0 other-scatter, 1 fission, 2 disappearance, 3 elastic
     int res_off;  //!< Offset into fp_res_ (window pole count entries)
+    int ch;       //!< Channel index, for this channel's own curvefit
   };
   // ---------------------------------------------------------------------
   // REWINDOWED FLIGHT PATH (fast segment). Optional: present only if the
