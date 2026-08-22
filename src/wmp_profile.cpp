@@ -21,6 +21,17 @@ void wmp_prof_register(WmpProfCounters* c)
 
 void wmp_prof_report()
 {
+#if !WMP_PROF_ENABLED
+  // NOTHING TO REPORT IN A PRODUCTION BUILD, so print nothing. The counters
+  // are all zero (wmp_prof_add compiles out), so the table body printed no
+  // rows -- but the header and the overhead line were emitted unconditionally
+  // on every run, and the overhead figure was garbage: wmp_prof_tick() returns
+  // 0 when profiling is off, so the calibration below computed
+  // (__rdtsc() - 0)/1000, i.e. the raw TSC over 1000, and reported ~1.75e10
+  // cyc/call. It also burned 1000 rdtsc calls at finalize for nothing.
+  // Build with -DWMP_PROF_ENABLED=1 to get the real report back.
+  return;
+#else
   WmpProfCounters tot;
   {
     std::lock_guard<std::mutex> lock(reg_mutex);
@@ -70,6 +81,7 @@ void wmp_prof_report()
               "measured section)\n",
     pair_cyc);
   std::printf(" =====================================================\n");
+#endif
 }
 
 } // namespace openmc
