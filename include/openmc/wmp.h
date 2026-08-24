@@ -115,6 +115,8 @@ public:
   //! cross sections in the resolved resonance regions with respect to
   //! temperature.
   //!
+  //! Used by tallies/derivative.cpp for temperature-derivative tallies.
+  //!
   //! \param E Incident neutron energy in [eV]
   //! \param sqrtkT Square root of temperature times Boltzmann constant
   //! \return Tuple of derivatives of elastic scattering, absorption, and
@@ -250,12 +252,12 @@ public:
   //! other-scatter into one group drops a residue PAIR from every pole:
   //! stride 8->6 for the 25 non-fissionable nuclides and 10->8 for U-235/238,
   //! 24.8% off the fast pole block, which matters because this evaluator is
-  //! memory-bound. Disabled for the rewindowed flight path (fl_*), whose
-  //! blocks are built against the historical four-group slot order.
+  //! memory-bound. Always on: it used to be disabled for the rewindowed
+  //! flight path, whose blocks were built against the historical four-group
+  //! slot order, but that path is gone.
   bool fast_merge_sct_ {false};
   int fast_ch_el_ {-1};             //!< channel index of MT2, -1 if not fit
 
-  int n_ext_ {0};   //!< externals per window; 0 for every v3 library
   int n_win_ {0};   //!< resolved window count
 
   bool lowe_present_ {false};
@@ -394,54 +396,6 @@ public:
   // MTs (1.3% of evaluator cost). The flight total and the sum of the
   // collision per-MT values therefore come from different representations
   // and may disagree by up to the fit tolerance.
-  //! One sub-window's metadata, 32 B. u_hi is carried HERE rather than read
-  //! from a separate bounds array: the search must load this record anyway, so
-  //! folding the upper edge in makes the boundary check free and removes a
-  //! whole array from the per-lookup dependent chain (4 touches -> 3).
-  struct FlWin {
-    double u_lo;    //!< Sub-window lower edge in sqrt(E)
-    double u_hi;    //!< Upper edge; the advance test reads it from this load
-    double inv_w;   //!< 1/(u_hi-u_lo): maps u to the local curvefit variable
-    uint32_t off;   //!< Offset of this window's block in fl_blk_ (doubles)
-    uint32_t np;    //!< Retained poles in this window
-  };
-  //! Threshold/window-bound delimited SEGMENT, inside which the sub-windows
-  //! are UNIFORM in sqrt(E) so one is found by arithmetic instead of a search.
-  //! The old index walked a 4*n_sub cell table into a bounds array with a
-  //! linear advance -- two large cold arrays and a data-dependent loop, and
-  //! rewindowing had made it worse by creating 6.5x more windows. Measured at
-  //! 39% of the fast kernel, more than the pole sweep itself.
-  struct FlSeg {
-    double u_lo;
-    double u_hi;
-    double inv_du; //!< n_win / (u_hi - u_lo)
-    int32_t win0;  //!< First sub-window index of this segment
-    int32_t nwin;
-  };
-  vector<FlSeg> fl_seg_;
-  vector<int32_t> fl_cell_seg_; //!< uniform cell -> first segment in that cell
-  double fl_u0_ {0.0};
-  double fl_seg_cell_inv_du_ {0.0};
-  bool fl_have_ {false};
-  int fl_order_ {0};              //!< Curvefit coefficients per channel
-  int fl_nch_ {0};                //!< Channels stored (channel specialisation)
-  double fl_cell_inv_du_ {0.0};
-  vector<double> fl_bounds_;      //!< [n_sub+1] sub-window edges in sqrt(E)
-  vector<int> fl_cell_first_;     //!< Uniform-cell -> first sub-window index
-  vector<FlWin> fl_win_;
-
-  //! BLOCK-HEADER layout. fl_win_ is a separate array fetched only to find the
-  //! block, so it is a whole link in the per-lookup dependent chain
-  //! (cell -> record -> block). Moving those 4 doubles to the head of the block
-  //! itself and storing BLOCK OFFSETS in the cell table makes it
-  //! cell -> block: the first line carries the metadata AND the start of the
-  //! curvefit. No extra data is stored -- the metadata moves rather than
-  //! duplicates. Header is [u_lo, u_hi, inv_w, next_off]; the pole count is
-  //! derived from next_off, so it needs no slot of its own.
-  static constexpr int FL_HDR = 4;
-  vector<uint32_t> fl_cell_blk_; //!< uniform cell -> block offset (doubles)
-  vector<double> fl_blk_;         //!< [curvefit | pole SoA] blocks, 64B aligned
-  double* fl_base_ {nullptr};     //!< Aligned base pointer into fl_blk_
   vector<vector<FastPartial>> fast_partials_; //!< Per-window partial channels
   vector<std::complex<double>> fp_res_;       //!< Partial-channel residues
 
@@ -466,7 +420,6 @@ public:
   // Pool: [pole, r_elastic, r_absorption, r_fission] like data_ columns
   tensor::Tensor<std::complex<double>> gdata_; //!< (n_pool, 4)
   // Externals: 4 per window, same column convention
-  tensor::Tensor<std::complex<double>> ext_data_; //!< (n_win, 4, 4)
 
   // Branch-free resolved pool kernel (SoA plain double, so the hot loop
   // vectorizes -- std::complex + the runtime |z| branch defeated the

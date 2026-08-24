@@ -1,6 +1,5 @@
 #include "openmc/physics.h"
 
-#include "openmc/wmp_profile.h"
 
 #include "openmc/bank.h"
 #include "openmc/bremsstrahlung.h"
@@ -35,41 +34,8 @@
 #include "openmc/tensor.h"
 #include <algorithm> // for max, min, max_element
 #include <cmath>     // for sqrt, exp, log, abs, copysign
-#include <cstdlib>   // for getenv (WMP_*_ACE isolation gates)
 
 namespace openmc {
-
-// ISOLATING THE WMP-vs-ACE k BIAS. Three behaviours below are gated on a
-// nuclide merely HAVING multipole data, not on that data being USED, so they
-// fire even when WMP_NO_FAST + WMP_FAST_ONLY force every cross section onto
-// ACE. Measured 2026-08-13: that all-ACE-with-WMP-loaded config still reads
-// +392 pcm vs pure ACE, so the bias lives here, not in the libraries.
-//   WMP_PLUMB_ACE=1   disable all three (brackets the effect)
-//   WMP_KT_ACE=1      free-gas target temperature -> kTs_[i_temp]
-//   WMP_FISSRX_ACE=1  sample partial fission reactions normally
-//   WMP_CHAN_ACE=1    select the inelastic level from tabulated ACE xs
-namespace wmp_plumb {
-inline bool all()
-{
-  static const bool v = std::getenv("WMP_PLUMB_ACE") != nullptr;
-  return v;
-}
-inline bool kt()
-{
-  static const bool v = std::getenv("WMP_KT_ACE") != nullptr;
-  return v || all();
-}
-inline bool fissrx()
-{
-  static const bool v = std::getenv("WMP_FISSRX_ACE") != nullptr;
-  return v || all();
-}
-inline bool chan()
-{
-  static const bool v = std::getenv("WMP_CHAN_ACE") != nullptr;
-  return v || all();
-}
-} // namespace wmp_plumb
 
 //==============================================================================
 // Non-member functions
@@ -614,7 +580,7 @@ Reaction& sample_fission(int i_nuclide, Particle& p)
 
   // Check to see if we are in a windowed multipole range.  WMP only supports
   // the first fission reaction.
-  if (nuc->multipole_ && !wmp_plumb::fissrx()) {
+  if (nuc->multipole_) {
     if (p.E() >= nuc->multipole_->E_min_ && p.E() <= nuc->multipole_->E_max_) {
       return *nuc->fission_rx_[0];
     }
@@ -748,7 +714,7 @@ void scatter(Particle& p, int i_nuclide)
     // NON-S(A,B) ELASTIC SCATTERING
 
     // Determine temperature
-    double kT = (nuc->multipole_ && !wmp_plumb::kt())
+    double kT = (nuc->multipole_)
                   ? p.sqrtkT() * p.sqrtkT()
                   : nuc->kTs_[i_temp];
 
@@ -782,12 +748,11 @@ void scatter(Particle& p, int i_nuclide)
     // all channels read the whole ~13 KB residue block when the walk
     // typically stops after a few. A channel not present in the fast fit
     // falls back to the ACE table.
-    bool fast = nuc->multipole_ && !wmp_plumb::chan() &&
+    bool fast = nuc->multipole_ &&
                 nuc->multipole_->fast_present_ &&
                 p.E() > nuc->multipole_->E_max_ &&
                 p.E() <= nuc->multipole_->fast_E_max_;
     WindowedMultipole::FastChanCtx chan_ctx;
-    uint64_t prof_tc = wmp_prof_tick();
     if (fast)
       nuc->multipole_->fast_chan_begin(p.E(), chan_ctx);
 
@@ -807,8 +772,6 @@ void scatter(Particle& p, int i_nuclide)
       }
       prob += rxs;
     }
-    if (fast)
-      wmp_prof_add(WPROF_COLL_CHAN, prof_tc);
 
     // Perform collision physics for inelastic scattering
     const auto& rx {nuc->reactions_[i]};

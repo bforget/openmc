@@ -472,7 +472,6 @@ list(APPEND libopenmc_SOURCES
   src/volume_calc.cpp
   src/weight_windows.cpp
   src/wmp.cpp
-  src/wmp_profile.cpp
   src/xml_interface.cpp
   src/xsdata.cpp)
 

@@ -1,6 +1,5 @@
 #include "openmc/simulation.h"
 
-#include "openmc/wmp_profile.h"
 
 #include "openmc/bank.h"
 #include "openmc/capi.h"
@@ -222,8 +221,6 @@ int openmc_simulation_finalize()
   simulation::time_total.stop();
 
   // WMP fast-range profiling report (diagnostic branch wmp-fast-profile)
-  if (mpi::master)
-    wmp_prof_report();
 
 #ifdef OPENMC_MPI
   // Reduce track count across ranks for correct reporting. In shared secondary
