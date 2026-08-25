@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint> // for the exponent-indexed fast window table
+#include <cstring> // for std::memcpy in fast_key()
 #include <string>
 #include <tuple>
 
@@ -332,8 +334,58 @@ public:
   bool fast_present_ {false};
   double fast_E_max_ {0.0};       //!< Upper energy of fast segment [eV]
   vector<double> fast_bounds_;    //!< Window bounds in sqrt(E) [n_fwin+1]
-  vector<int> fast_cell_first_;   //!< O(1) index over fast windows
-  double fast_cell_inv_du_ {0.0};
+
+  //! EXPONENT-INDEXED window table. The fast mesh is geometric, not uniform:
+  //! window widths span up to 4500x within one nuclide (and the fixed
+  //! boundaries some nuclides carry make it more uneven still). A coarse table
+  //! LINEAR in u therefore resolves the high-u end finely and the low-u end
+  //! not at all, so the forward scan there walks many narrow windows one
+  //! dependent load at a time. Measured over the 556 nuclides whose fast
+  //! segment has more than one window: 0.49 scan steps per lookup on average,
+  //! but 71 of them average more than 1 step, the worst averages 3.8 (Bk-248)
+  //! and the worst single lookup takes 130 steps (Sn-113).
+  //!
+  //! Indexing on the EXPONENT BITS of the double buys geometric bucketing for
+  //! free -- no log(), no division, just a shift. Reinterpreting a positive
+  //! double as an integer is monotone, so (bits >> FAST_KEY_SHIFT) is a
+  //! monotone key with 2^(52-SHIFT) buckets per octave. At SHIFT = 46 that is
+  //! 64 buckets per octave, which takes the same measurements to 0.065 steps
+  //! on average, 0.75 worst-nuclide and 19 worst-case, for a table of 849 B
+  //! (median) and 0.48 MB over the whole library.
+  //!
+  //! NOTE this replaced a packed-WinRec experiment, which was the obvious
+  //! thing to try since the resolved path gained 18% from exactly that. It
+  //! bought 1.04x here and was dropped: the fast metadata is ~1.4 KB per
+  //! nuclide, so it stays resident and the scatter never costs anything. The
+  //! scan length was the whole problem.
+  static constexpr int FAST_KEY_SHIFT = 46;
+  vector<uint16_t> fast_bidx_;    //!< bucket -> first window (n_fwin <= 65535)
+  int64_t fast_key_lo_ {0};       //!< key of fast_bounds_.front()
+
+  //! Monotone integer key of a POSITIVE double (u = sqrt(E) is always > 0
+  //! here; evaluate_fast floors E before taking the root).
+  static inline int64_t fast_key(double u)
+  {
+    uint64_t v;
+    std::memcpy(&v, &u, sizeof(v));
+    return static_cast<int64_t>(v >> FAST_KEY_SHIFT);
+  }
+
+  //! Locate the fast window containing sqrt(E). One shift, one clamped load,
+  //! then a forward scan that almost never runs. Shared by all four fast
+  //! entry points so the index lives in exactly one place.
+  int fast_window(double sqrtE) const
+  {
+    int n_win = static_cast<int>(fw_off_.size()) - 1;
+    int64_t k = fast_key(sqrtE) - fast_key_lo_;
+    k = std::min(std::max(k, static_cast<int64_t>(0)),
+                 static_cast<int64_t>(fast_bidx_.size()) - 1);
+    int w = fast_bidx_[k];
+    while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
+      ++w;
+    return w;
+  }
+
   vector<int> fw_off_;            //!< Flattened pole offsets [n_fwin+1]
   // Interleaved per-pole record (single memory stream per lookup):
   // [pole, r_elastic, r_fission, r_disappearance, r_other] x n_flat

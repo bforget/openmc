@@ -633,19 +633,29 @@ void WindowedMultipole::read_fast_segment(hid_t group)
     }
   }
 
-  // O(1) two-level index over the fast windows
+  // O(1) exponent-indexed window table (see wmp.h for why it is keyed on the
+  // double's bits rather than on u itself).
   {
-    int n_cells = 4 * n_win;
-    double u_lo = fast_bounds_.front();
-    double u_hi = fast_bounds_.back();
-    fast_cell_inv_du_ = n_cells / (u_hi - u_lo);
-    fast_cell_first_.resize(n_cells);
+    if (n_win > 65535)
+      fatal_error(fmt::format("{}: {} fast windows exceeds the 65535 the "
+                              "exponent-indexed table can address",
+        name_, n_win));
+    fast_key_lo_ = fast_key(fast_bounds_.front());
+    int64_t key_hi = fast_key(fast_bounds_.back());
+    // one bucket per distinct key, plus a trailing bucket so the clamp in
+    // fast_window() lands on a real entry for u at or above the last bound
+    size_t n_bucket = static_cast<size_t>(key_hi - fast_key_lo_) + 2;
+    fast_bidx_.resize(n_bucket);
     int w = 0;
-    for (int i = 0; i < n_cells; ++i) {
-      double u_cell = u_lo + i / fast_cell_inv_du_;
-      while (w < n_win - 1 && fast_bounds_[w + 1] <= u_cell)
+    for (size_t i = 0; i < n_bucket; ++i) {
+      // lower edge of bucket i, reconstructed from the key
+      uint64_t bits = static_cast<uint64_t>(fast_key_lo_ + static_cast<int64_t>(i))
+                      << FAST_KEY_SHIFT;
+      double u_bucket;
+      std::memcpy(&u_bucket, &bits, sizeof(u_bucket));
+      while (w < n_win - 1 && fast_bounds_[w + 1] <= u_bucket)
         ++w;
-      fast_cell_first_[i] = w;
+      fast_bidx_[i] = static_cast<uint16_t>(w);
     }
   }
 
@@ -775,13 +785,8 @@ std::tuple<double, double, double> WindowedMultipole::evaluate_fast(
 
   double sqrtE = std::sqrt(E);
 
-  // O(1) window lookup over the fast bounds
-  int n_win = fw_off_.size() - 1;
-  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
-  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
-  int w = fast_cell_first_[cell];
-  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
-    ++w;
+  // O(1) exponent-indexed window lookup (see wmp.h)
+  int w = fast_window(sqrtE);
 
   int k0 = fw_off_[w];
   int k1 = fw_off_[w + 1];
@@ -935,13 +940,8 @@ double WindowedMultipole::evaluate_fast_elastic(double E) const
 
   double sqrtE = std::sqrt(E);
 
-  // Same O(1) window lookup as evaluate_fast's full-sweep path.
-  int n_win = fw_off_.size() - 1;
-  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
-  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
-  int w = fast_cell_first_[cell];
-  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
-    ++w;
+  // Same window lookup as evaluate_fast's full-sweep path.
+  int w = fast_window(sqrtE);
 
   int k0 = fw_off_[w];
   int np = fw_off_[w + 1] - k0;
@@ -984,13 +984,8 @@ void WindowedMultipole::evaluate_fast_channels(double E, double* out) const
 {
   double sqrtE = std::sqrt(E);
 
-  // O(1) window lookup (same as evaluate_fast)
-  int n_win = fw_off_.size() - 1;
-  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
-  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
-  int w = fast_cell_first_[cell];
-  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
-    ++w;
+  // Same window lookup as evaluate_fast
+  int w = fast_window(sqrtE);
 
   int k0 = fw_off_[w];
   int np = fw_off_[w + 1] - k0;
@@ -1028,13 +1023,8 @@ void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
 {
   double sqrtE = std::sqrt(E);
 
-  // O(1) window lookup (same as evaluate_fast)
-  int n_win = fw_off_.size() - 1;
-  int cell = (int)((sqrtE - fast_bounds_[0]) * fast_cell_inv_du_);
-  cell = std::min(std::max(cell, 0), (int)fast_cell_first_.size() - 1);
-  int w = fast_cell_first_[cell];
-  while (w < n_win - 1 && sqrtE >= fast_bounds_[w + 1])
-    ++w;
+  // Same window lookup as evaluate_fast
+  int w = fast_window(sqrtE);
 
   ctx.w = w;
   ctx.k0 = fw_off_[w];
