@@ -292,7 +292,7 @@ void WindowedMultipole::read_global_segment(hid_t group)
     }
 
     // Build the branch-free SoA pool arrays (see wmp.h). The 1/v pole
-    // (Re p == 0) is broadening-invariant and must NOT go through zpf8h:
+    // (Re p == 0) is broadening-invariant and must NOT go through w_rational:
     // zero its SoA residues so the vector loop skips it, and stash its data
     // + owning window for a separate exact-0K add.
     gs_stride_ = fissionable_ ? 8 : 6;   // drop the all-zero fission residue
@@ -1052,6 +1052,119 @@ void WindowedMultipole::fast_chan_begin(double E, FastChanCtx& ctx) const
   }
 }
 
+//==============================================================================
+// Faddeeva kernels for the broadened pole sweep.
+//
+// Both kernels are the same branch-free shifted rational form
+//
+//     w(z) ~ N(zt) / D(zt),        zt = z + i*delta,
+//
+// with D EVEN in zt (hence a polynomial in zt^2, which halves its Horner
+// chain) and N's coefficients alternating real/imaginary. That structure is
+// not a convenience: it makes the approximation satisfy w(-conj z) =
+// conj w(z) EXACTLY, the reflection symmetry of the true Faddeeva function.
+// The leading numerator coefficient is pinned to i/sqrt(pi), which reproduces
+// the w(z) ~ i/(sqrt(pi) z) tail, so neither kernel needs an asymptotic
+// branch at large |z|.
+//
+// The approximant's own poles lie on the real zt axis, i.e. at Im(z) =
+// -delta. Resonance poles have Im(p) > 0, so the sweep's z is always in the
+// upper half plane and the kernel is evaluated at distance >= delta from its
+// nearest pole. It cannot blow up on any argument this library can produce.
+//==============================================================================
+
+//! ORDER 6, delta = 1.5 -- THE DEFAULT.
+//!
+//! Near-minimax fit of the RELATIVE error in w over |Re z| <= 600 and
+//! 1e-4 <= Im z <= 1200, which brackets every pole of the 557-nuclide library
+//! between 250 K and 3000 K. Dropping Humlicek's Gauss-Hermite construction
+//! -- which targets the whole upper half plane rather than this domain -- is
+//! what pays for the order reduction.
+//!
+//! ACCURACY, against scipy.special.wofz on a 900k-point grid: 1.6e-5
+//! relative, essentially FLAT over the domain. Order 8 below is the more
+//! accurate of the two in the far field (1.4e-7 for |z| > 4) but decays to
+//! 1.1e-3 at |z| < 1 -- that is, ON RESONANCE, where the cross section peaks
+//! and where accuracy actually buys something. Trading far-field precision
+//! (poles there contribute little, |w| ~ 1/|z|) for on-resonance precision is
+//! why the cheaper kernel is also the better one here: on U-238 at 902 K the
+//! mean error in the total cross section is 1.6e-5 and the 1/E capture
+//! resonance integral is reproduced to 1.5e-6, against the 1e-3
+//! reconstruction tolerance of the pointwise libraries WMP is verified
+//! against.
+//!
+//! Order 6 also keeps D(zt) inside single-precision range, which order 8 does
+//! not (zt^8 squared overflows float at the |z| this library reaches); a float
+//! evaluation of this kernel still holds 1.7e-5, which leaves a
+//! narrow-precision or GPU port open.
+static inline void w_rational6(double zr, double zi, double& wr, double& wi)
+{
+  zi += 1.5; // delta
+  double nr = 0.0, ni = 0.5641895835477563, t; // leading coeff i/sqrt(pi)
+  t = nr*zr - ni*zi - 0.8463988774687549; ni = nr*zi + ni*zr; nr = t;
+  t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 4.262789761626753; nr = t;
+  t = nr*zr - ni*zi + 5.57957343594273; ni = nr*zi + ni*zr; nr = t;
+  t = nr*zr - ni*zi; ni = nr*zi + ni*zr + 8.876835541419577; nr = t;
+  t = nr*zr - ni*zi - 8.2804011586059; ni = nr*zi + ni*zr; nr = t;
+  double zzr = zr*zr - zi*zi, zzi = 2.0*zr*zi;
+  double dnr = 1.0, dni = 0.0;
+  t = dnr*zzr - dni*zzi - 5.810043673216703; dni = dnr*zzi + dni*zzr; dnr = t;
+  t = dnr*zzr - dni*zzi + 6.844707994387722; dni = dnr*zzi + dni*zzr; dnr = t;
+  t = dnr*zzr - dni*zzi - 0.901452218111202; dni = dnr*zzi + dni*zzr; dnr = t;
+  double dm = 1.0 / (dnr*dnr + dni*dni);
+  wr = (nr*dnr + ni*dni) * dm;
+  wi = (ni*dnr - nr*dni) * dm;
+}
+
+//! ORDER 8, delta = 0.9 -- the original PHYSOR 2022 kernel (Forget, Yu and
+//! Ridley), i.e. Humlicek's Gauss-Hermite rational recast into Schreier's
+//! ratio-of-polynomials form.
+//!
+//! RETAINED, BUT NOT CALLED in a default build: set WMP_W_ORDER to 8 to fall
+//! back to it, which is worth doing to establish whether a discrepancy comes
+//! from the Faddeeva approximation or from somewhere else. Three more complex
+//! multiplies than order 6 and, on the metrics that matter here, less
+//! accurate -- see the note on error placement above.
+static inline void w_rational8(double zr, double zi, double& wr, double& wi)
+{
+  zi += 0.9; // delta
+  double nr = 0.0, ni = 0.564189504758109, t;
+  t = nr*zr - ni*zi; ni = nr*zi + ni*zr; nr = t - 0.507771291744591;
+  t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 8.07354660639634; nr = t;
+  t = nr*zr - ni*zi + 6.75847413957232; ni = nr*zi + ni*zr; nr = t;
+  t = nr*zr - ni*zi; ni = nr*zi + ni*zr + 31.490536152863; nr = t;
+  t = nr*zr - ni*zi - 21.9357456686406; ni = nr*zi + ni*zr; nr = t;
+  t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 32.310199761603; nr = t;
+  t = nr*zr - ni*zi + 11.7559071436993; ni = nr*zi + ni*zr; nr = t;
+  double zzr = zr*zr - zi*zi, zzi = 2.0*zr*zi;
+  double dnr = 1.0, dni = 0.0;
+  t = dnr*zzr - dni*zzi - 14.0; dni = dnr*zzi + dni*zzr; dnr = t;
+  t = dnr*zzr - dni*zzi + 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
+  t = dnr*zzr - dni*zzi - 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
+  t = dnr*zzr - dni*zzi + 6.5625; dni = dnr*zzi + dni*zzr; dnr = t;
+  double dm = 1.0 / (dnr*dnr + dni*dni);
+  wr = (nr*dnr + ni*dni) * dm;
+  wi = (ni*dnr - nr*dni) * dm;
+}
+
+//! Which kernel the sweep uses. Both are static inline in this translation
+//! unit, so the unselected one costs nothing and the selected one inlines
+//! into the simd loop exactly as when it was written out by hand there.
+#ifndef WMP_W_ORDER
+#  define WMP_W_ORDER 6
+#endif
+
+static inline void w_rational(double zr, double zi, double& wr, double& wi)
+{
+#if WMP_W_ORDER == 6
+  w_rational6(zr, zi, wr, wi);
+#elif WMP_W_ORDER == 8
+  w_rational8(zr, zi, wr, wi);
+#else
+#  error "WMP_W_ORDER must be 6 or 8"
+#endif
+}
+
 //! Broadened pole sweep, specialised at COMPILE TIME on the record stride and
 //! whether the nuclide is fissionable.
 //!
@@ -1071,24 +1184,9 @@ static inline void pole_sweep(const double* pol, int np, double sqrtE,
     double pr = r[0], pi = r[1];
     double p2r = pr * pr - pi * pi, p2i = 2.0 * pr * pi;
     double zr = (pr - sqrtE) * inv_xi;
-    double zi = pi * inv_xi + 0.9;
-    double nr = 0.0, ni = 0.564189504758109, t;
-    t = nr*zr - ni*zi; ni = nr*zi + ni*zr; nr = t - 0.507771291744591;
-    t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 8.07354660639634; nr = t;
-    t = nr*zr - ni*zi + 6.75847413957232; ni = nr*zi + ni*zr; nr = t;
-    t = nr*zr - ni*zi; ni = nr*zi + ni*zr + 31.490536152863; nr = t;
-    t = nr*zr - ni*zi - 21.9357456686406; ni = nr*zi + ni*zr; nr = t;
-    t = nr*zr - ni*zi; ni = nr*zi + ni*zr - 32.310199761603; nr = t;
-    t = nr*zr - ni*zi + 11.7559071436993; ni = nr*zi + ni*zr; nr = t;
-    double zzr = zr*zr - zi*zi, zzi = 2.0*zr*zi;
-    double dnr = 1.0, dni = 0.0;
-    t = dnr*zzr - dni*zzi - 14.0; dni = dnr*zzi + dni*zzr; dnr = t;
-    t = dnr*zzr - dni*zzi + 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
-    t = dnr*zzr - dni*zzi - 52.5; dni = dnr*zzi + dni*zzr; dnr = t;
-    t = dnr*zzr - dni*zzi + 6.5625; dni = dnr*zzi + dni*zzr; dnr = t;
-    double dm = 1.0 / (dnr*dnr + dni*dni);
-    double wr = (nr*dnr + ni*dni) * dm;
-    double wi = (ni*dnr - nr*dni) * dm;
+    double zi = pi * inv_xi;
+    double wr, wi;
+    w_rational(zr, zi, wr, wi); // adds its own delta shift
     double wgr = -sq * wi, wgi = sq * wr;
     double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
     double br = (sqrtE + pr + hr) * invE;
@@ -1190,9 +1288,9 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
 
     // Pool poles: branch-free SoA sweep (vectorizable). Every pole takes the
     // SAME uniform path -- no runtime |z| test. At T>0 that is the inlined
-    // zpf8h Faddeeva sigma basis (Im(z)=beta/xi>0 for resonance poles, so no
-    // conjugation); the 1/v pole's SoA residues are zeroed here and its exact
-    // 0K contribution is added below. At T=0 the plain pole sum.
+    // w_rational Faddeeva sigma basis (Im(z)=beta/xi>0 for resonance poles, so
+    // no conjugation); the 1/v pole's SoA residues are zeroed here and its
+    // exact 0K contribution is added below. At T=0 the plain pole sum.
     // ONE offset into this window's contiguous block, then a sequential run:
     // curvefit triplets first, then this window's pole records.
     const int ncf3 = cf_present_ ? cf_n_ * cf_ch_ : 0;
@@ -1215,16 +1313,22 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
           sig_f += rec[6] * br - rec[7] * bi;
       }
     } else {
-      // UNIFORM zpf8h SWEEP -- no near/far partition, no branch, one pass.
+      // UNIFORM RATIONAL SWEEP -- no near/far partition, no branch, one pass.
       // PROJECT.md §5.6 recorded "catastrophic cancellation in the sigma basis
       // at large |z| -- needs the analytic Laurent form". Measured 2026-07-29
-      // that does NOT apply to the zpf8h path: its error in w(z) is ~1e-7 flat
-      // from |z| = 4 to 50 and the sigma basis amplifies it by 1.0x (worst case
-      // 1e-3 AT the resonance, which we already accept); the exact form holds
-      // to 1e-15 at |z| = 100 against mpmath. The old note concerns naively
-      // substituting the Laurent SERIES of w(z), a different construction.
-      // So the partition bought speed, not accuracy, at the cost of a compare
-      // per pole plus a compaction and a scatter pass.
+      // that does NOT apply here: the rational kernel's error in w(z) is ~1e-7
+      // flat from |z| = 4 to 50 (order 8; order 6 is 1.4e-5 there) and the
+      // sigma basis amplifies it by 1.0x; the exact form holds to 1e-15 at
+      // |z| = 100 against mpmath. The old note concerns naively substituting
+      // the Laurent SERIES of w(z), a different construction. So the partition
+      // bought speed, not accuracy, at the cost of a compare per pole plus a
+      // compaction and a scatter pass.
+      //
+      // The "worst case 1e-3 AT the resonance" the earlier note accepted was
+      // an order-8 artefact -- that kernel's error PEAKS at |z| < 1, where the
+      // cross section does too. The order-6 default holds 1.6e-5 there
+      // instead, so on-resonance accuracy improved when the order came down
+      // (see w_rational6).
       // one predictable branch on a member constant; both instantiations
       // carry compile-time offsets (see pole_sweep).
       if (fissionable_)
