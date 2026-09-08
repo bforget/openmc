@@ -127,6 +127,32 @@ static int wmp_channel_kind(int mt)
   return 0;
 }
 
+//! Scratch bound for the per-pole kernel values a depletion lookup keeps.
+//! The widest resolved window in the shipped 557-nuclide library holds 35
+//! poles (Zn-64); this is a stack array, so the bound is generous and the
+//! overrun is a fatal_error rather than a silent truncation.
+constexpr int WMP_DEP_MAX_POLES = 256;
+
+//! Map this segment's MT list onto the six DEPLETION_RX slots.
+//!
+//! dep[j] receives the index into `mts` carrying DEPLETION_RX[j], or -1 when
+//! the segment does not carry that reaction. Done ONCE at load so the hot
+//! loops iterate over the two or three channels that actually exist instead
+//! of scanning the full MT list (44-55 channels in the fast segment) on every
+//! lookup.
+static void build_dep_map(const vector<int>& mts, int (&dep)[6])
+{
+  for (int j = 0; j < 6; ++j) {
+    dep[j] = -1;
+    for (int c = 0; c < static_cast<int>(mts.size()); ++c) {
+      if (mts[c] == DEPLETION_RX[j]) {
+        dep[j] = c;
+        break;
+      }
+    }
+  }
+}
+
 //! Read the LOW-ENERGY segment: curvefit only, no poles.
 void WindowedMultipole::read_lowe_segment(hid_t group)
 {
@@ -153,6 +179,23 @@ void WindowedMultipole::read_lowe_segment(hid_t group)
     lowe_cf_[3 * k + 0] = vs;
     lowe_cf_[3 * k + 1] = va;
     lowe_cf_[3 * k + 2] = vf;
+  }
+  // DEPLETION CHANNELS, kept compactly. The collapse above throws the per-MT
+  // coefficients away, and this segment is precisely where a thermal
+  // (n,alpha) or (n,p) lives -- B-10's entire depletion is here. Only the six
+  // DEPLETION_RX slots are retained rather than the whole per-MT array:
+  // n_cf * 6 doubles, a few hundred bytes per nuclide.
+  vector<int> lowe_mts(mts_ds.shape(0));
+  for (int c = 0; c < static_cast<int>(mts_ds.shape(0)); ++c)
+    lowe_mts[c] = static_cast<int>(mts_ds[c]);
+  build_dep_map(lowe_mts, lowe_dep_ch_);
+  lowe_dep_cf_.assign((size_t)n_cf * 6, 0.0);
+  for (int j = 0; j < 6; ++j) {
+    const int c = lowe_dep_ch_[j];
+    if (c < 0 || c >= n_ch)
+      continue;
+    for (int k = 0; k < n_cf; ++k)
+      lowe_dep_cf_[(size_t)k * 6 + j] = cf(k, c);
   }
   lowe_present_ = true;
 }
@@ -200,6 +243,24 @@ void WindowedMultipole::read_global_segment(hid_t group)
         kind[c] = 2;
       }
     }
+
+    // DEPLETION CHANNEL MAP (see wmp.h). DEPLETION_RX order is fixed:
+    // (n,gamma) (n,p) (n,alpha) (n,2n) (n,3n) (n,4n).
+    build_dep_map(mts_, dep_ch_);
+    // Does (n,gamma) = absorption - fission still hold? ONLY when MT102 is the
+    // single disappearance channel. Two ways it can fail, and both occur in
+    // this library:
+    //   * a second disappearance channel (Gd-157 carries MT107, B-10 carries
+    //     103/105/107) -- absorption - fission then LUMPS them into (n,gamma);
+    //   * a lone disappearance channel that is not MT102 -- the difference
+    //     would then be attributed to (n,gamma) though no capture is carried.
+    // Li-6 is the quiet case: MT102 + MT105 (n,t), so its capture rate would
+    // be overstated by the whole (n,t) rate without the split.
+    int n_dis = 0;
+    for (int c = 0; c < n_ch; ++c)
+      if (kind[c] == 2)
+        ++n_dis;
+    dep_needs_split_ = !(n_dis == 1 && dep_ch_[0] >= 0);
 
     int n_pool = poles.shape(0);
     res_mt_ = residues;                       // keep per-MT for tallies
@@ -568,6 +629,12 @@ void WindowedMultipole::read_fast_segment(hid_t group)
   }
   // Elastic channel, cached for the lazy split (evaluate_fast_elastic).
   fast_ch_el_ = fast_channel_of_mt(2);
+  // DEPLETION CHANNEL MAP for this segment, straight off the MT->channel
+  // table built above. Unlike the resolved case there is no shortcut worth
+  // taking: above the seam the disappearance lump routinely holds several
+  // reactions at once, so the split is always needed when depletion is on.
+  for (int j = 0; j < 6; ++j)
+    fast_dep_ch_[j] = fast_channel_of_mt(DEPLETION_RX[j]);
   fw_chan_res_.assign((size_t)n_flat * n_mts, 0.0);
 
   for (int w = 0; w < n_win; ++w) {
@@ -771,7 +838,7 @@ static inline void fast_sweep(const double* B, int np, double u, double& el,
 }
 
 std::tuple<double, double, double> WindowedMultipole::evaluate_fast(
-  double E) const
+  double E, double* dep) const
 {
   // DEFENSIVE FLOOR. The low-E curvefit basis starts at 1/E, so E == 0 (or a
   // NaN arriving from a bad collision) turns every channel into NaN, which
@@ -791,6 +858,32 @@ std::tuple<double, double, double> WindowedMultipole::evaluate_fast(
   int k0 = fw_off_[w];
   int k1 = fw_off_[w + 1];
   int np = k1 - k0;
+
+  // DEPLETION CHANNELS from the poles, not from the ACE tables.
+  //
+  // This is what lets a depletion run keep the fast range on the multipole
+  // representation; without it nuclide.cpp had to fall back to the tabulated
+  // reaction data, mixing sources, and had to force the ACE grid search on
+  // every fast lookup (lazy_grid). Reusing fast_chan_begin/fast_chan_xs --
+  // the same pair the collision kernel uses -- computes the pole reciprocals
+  // ONCE for all six channels, applies each channel's own threshold clamp,
+  // and adds the per-MT curvefit background that carries most of the
+  // fast-range magnitude.
+  //
+  // fast_chan_begin repeats the window lookup, which is an O(1) index into
+  // the exponent-keyed table rather than a search, and the fast range is
+  // unbroadened so no Faddeeva evaluation is involved either way.
+  if (dep) {
+    FastChanCtx ctx;
+    fast_chan_begin(E, ctx);
+    for (int j = 0; j < 6; ++j) {
+      const int c = fast_dep_ch_[j];
+      if (c < 0)
+        continue;
+      const double v = fast_chan_xs(ctx, E, c);
+      dep[j] += (v > 0.0) ? v : 0.0;
+    }
+  }
 
   // Real second-order-section sweep (SoA, plain double -> vectorizes). The
   // fast range is unbroadened, so sigma = (n1*u + n0)/((u-alpha)^2 + beta^2)
@@ -1163,9 +1256,15 @@ static inline void w_rational(double zr, double zi, double& wr, double& wi)
 //! it was tried once with a RUNTIME stride and an in-loop `if (fiss)` and cost
 //! 20%: the compiler could no longer fold constant offsets or unroll. As
 //! template parameters, both variants keep folded offsets and neither branches.
-template <int STRIDE, bool FISS>
+//! SAVE writes each pole's broadened kernel (br, bi) into `brbi` so a
+//! per-MT pass can reuse it. That pair is the ONLY thing w(z) is needed for,
+//! so saving it is what lets depletion read any channel's residues without a
+//! second Faddeeva evaluation. Off by default and template-gated, so the
+//! transport-only path compiles to exactly what it did before.
+template <int STRIDE, bool FISS, bool SAVE = false>
 static inline void pole_sweep(const double* pol, int np, double sqrtE,
-  double invE, double inv_xi, double& sig_s, double& sig_a, double& sig_f)
+  double invE, double inv_xi, double& sig_s, double& sig_a, double& sig_f,
+  double* brbi = nullptr)
 {
   const double sq = SQRT_PI * inv_xi;
 #pragma omp simd reduction(+ : sig_s, sig_a, sig_f)
@@ -1181,6 +1280,10 @@ static inline void pole_sweep(const double* pol, int np, double sqrtE,
     double hr = p2r * wgr - p2i * wgi, hi = p2r * wgi + p2i * wgr;
     double br = (sqrtE + pr + hr) * invE;
     double bi = (pi + hi) * invE;
+    if (SAVE) {
+      brbi[2 * k] = br;
+      brbi[2 * k + 1] = bi;
+    }
     sig_s += r[2] * br - r[3] * bi;
     sig_a += r[4] * br - r[5] * bi;
     if (FISS)
@@ -1189,7 +1292,7 @@ static inline void pole_sweep(const double* pol, int np, double sqrtE,
 }
 
 std::tuple<double, double, double> WindowedMultipole::evaluate(
-  double E, double sqrtkT) const
+  double E, double sqrtkT, double* dep) const
 {
   // DEFENSIVE FLOOR. The low-E curvefit basis starts at 1/E, so E == 0 (or a
   // NaN arriving from a bad collision) turns every channel into NaN, which
@@ -1234,6 +1337,20 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         s0 += lowe_cf_[3 * k + 0] * fac[k];
         a0 += lowe_cf_[3 * k + 1] * fac[k];
         f0 += lowe_cf_[3 * k + 2] * fac[k];
+      }
+      // DEPLETION CHANNELS. Same `fac` basis the transport triplet just used,
+      // so this is n_cf*6 FMAs over an array already in L1 -- no second
+      // broadening call. Below the resolved seam there are no poles, so this
+      // is the whole depletion cross section here.
+      if (dep && !lowe_dep_cf_.empty()) {
+        for (int k = 0; k < lowe_n_; ++k) {
+          const double* c = &lowe_dep_cf_[(size_t)k * 6];
+          for (int j = 0; j < 6; ++j)
+            dep[j] += c[j] * fac[k];
+        }
+        for (int j = 0; j < 6; ++j)
+          if (dep[j] < 0.0)
+            dep[j] = 0.0;
       }
       // SAME FLOOR AS THE RESOLVED BRANCH. scatter() reaches the inelastic
       // loop only when prob <= cutoff, and in the multipole path that loop
@@ -1289,6 +1406,40 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     const double* pol = blk + ncf3;
     const int np_w = wrec.np;
     int ps = win_start_[i_window], pe = win_end_[i_window];
+    // DEPLETION SPLIT for this window. Only when the caller asked for it AND
+    // (n,gamma) = absorption - fission is not already exact (dep_needs_split_,
+    // false for 441 of the 557 shipped nuclides, which therefore run exactly
+    // the code they ran before -- their dep[0] is filled by the exact
+    // difference at the end of this function, so passing `dep` always yields
+    // a correct answer regardless of which path a nuclide takes).
+    const bool do_dep = (dep != nullptr) && dep_needs_split_;
+    array<double, 2 * WMP_DEP_MAX_POLES> brbi;
+    if (do_dep && np_w > WMP_DEP_MAX_POLES) {
+      fatal_error("WMP depletion: window holds " + std::to_string(np_w) +
+                  " poles, above the " + std::to_string(WMP_DEP_MAX_POLES) +
+                  "-pole scratch bound (widest shipped window is 35).");
+    }
+    //! Accumulate this window's per-MT depletion channels from (br, bi) that
+    //! the transport sweep already produced. Poles are laid out in pool order
+    //! from ps, so res_mt_(ps+i, c) is this pole's channel c; the row is
+    //! contiguous, so the two or three live channels come from one line. The
+    //! 1/v pole is SKIPPED here exactly as gs_aos_ zeroes it, and added back
+    //! with the WIN_HAS_ONEV block below.
+    auto accum_dep = [&](const double* rec0, int gstr) {
+      for (int i = 0; i < np_w; ++i) {
+        if (rec0[(size_t)i * gstr] == 0.0)
+          continue; // 1/v pole: handled separately, see below
+        const double br = brbi[2 * i], bi = brbi[2 * i + 1];
+        for (int j = 0; j < 6; ++j) {
+          const int c = dep_ch_[j];
+          if (c < 0)
+            continue;
+          const std::complex<double> r = res_mt_(ps + i, c);
+          dep[j] += r.real() * br - r.imag() * bi;
+        }
+      }
+    };
+
     if (xi <= 0.0) {
       // one 64 B record per pole, sequential -> one cache line per pole
       const double* rec = pol;
@@ -1297,11 +1448,17 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
         double dr = sqrtE - rec[0], di = -rec[1];
         double minv = 1.0 / (dr * dr + di * di);
         double br = dr * minv, bi = -di * minv;
+        if (do_dep) {
+          brbi[2 * i] = br;
+          brbi[2 * i + 1] = bi;
+        }
         sig_s += rec[2] * br - rec[3] * bi;
         sig_a += rec[4] * br - rec[5] * bi;
         if (fissionable_)
           sig_f += rec[6] * br - rec[7] * bi;
       }
+      if (do_dep)
+        accum_dep(pol, gs_stride_);
     } else {
       // UNIFORM RATIONAL SWEEP -- no near/far partition, no branch, one pass.
       // PROJECT.md §5.6 recorded "catastrophic cancellation in the sigma basis
@@ -1321,12 +1478,23 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       // (see w_rational6).
       // one predictable branch on a member constant; both instantiations
       // carry compile-time offsets (see pole_sweep).
-      if (fissionable_)
+      if (do_dep) {
+        // SAVE variant: same sweep, same w(z) calls, but each pole's kernel
+        // is kept so the per-MT pass below can reuse it.
+        if (fissionable_)
+          pole_sweep<8, true, true>(pol, np_w, sqrtE, invE, inv_xi,
+                                    sig_s, sig_a, sig_f, brbi.data());
+        else
+          pole_sweep<6, false, true>(pol, np_w, sqrtE, invE, inv_xi,
+                                     sig_s, sig_a, sig_f, brbi.data());
+        accum_dep(pol, gs_stride_);
+      } else if (fissionable_) {
         pole_sweep<8, true>(pol, np_w, sqrtE, invE, inv_xi,
                             sig_s, sig_a, sig_f);
-      else
+      } else {
         pole_sweep<6, false>(pol, np_w, sqrtE, invE, inv_xi,
                              sig_s, sig_a, sig_f);
+      }
     }
     // 1/v background pole: exact 0K value (broadening-invariant, any T).
     // Tested against THIS window's pointer range -- several windows can point
@@ -1338,6 +1506,18 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       sig_s += onev_rs_.real() * br - onev_rs_.imag() * bi;
       sig_a += onev_ra_.real() * br - onev_ra_.imag() * bi;
       sig_f += onev_rf_.real() * br - onev_rf_.imag() * bi;
+      // Its per-MT share, skipped by accum_dep for exactly this reason. The
+      // 1/v pole carries the thermal capture of many nuclides, so omitting it
+      // here would silently under-report (n,gamma) at low energy.
+      if (do_dep && onev_idx_ >= 0) {
+        for (int j = 0; j < 6; ++j) {
+          const int c = dep_ch_[j];
+          if (c < 0)
+            continue;
+          const std::complex<double> r = res_mt_(onev_idx_, c);
+          dep[j] += r.real() * br - r.imag() * bi;
+        }
+      }
     }
 
     // Per-window smooth-background CURVEFIT, ADDED to the pole sum (the
@@ -1352,6 +1532,21 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
       } else {
         double t = invE; // 0K basis: 1/E, 1/sqrtE, 1, sqrtE, ...
         for (int k = 0; k < cf_n_; ++k) { fac[k] = t; t *= sqrtE; }
+      }
+      // DEPLETION share of the background, from the per-MT coefficients the
+      // load kept in cf_mt_. Same `fac` the transport curvefit just used, so
+      // no second broadening call. For a nuclide whose resolved segment has
+      // no poles at all -- B-10 -- this IS its depletion cross section.
+      if (do_dep && cf_mt_.size() > 0) {
+        const int nch_mt = cf_mt_.shape(2);
+        for (int k = 0; k < cf_n_; ++k) {
+          for (int j = 0; j < 6; ++j) {
+            const int cc = dep_ch_[j];
+            if (cc < 0 || cc >= nch_mt)
+              continue;
+            dep[j] += cf_mt_(i_window, k, cc) * fac[k];
+          }
+        }
       }
       // curvefit lives at the FRONT of this window's block (see wmp.h);
       // cf_blk_ was freed once the blocks were materialised at load.
@@ -1403,6 +1598,26 @@ std::tuple<double, double, double> WindowedMultipole::evaluate(
     sig_s = (sig_s > 0.0) ? sig_s : 1.0e-5;
     sig_a = (sig_a > 0.0) ? sig_a : 0.0;
     sig_f = (sig_f > 0.0) ? sig_f : 0.0;
+    if (dep) {
+      if (do_dep) {
+        // Split path: clamp the per-MT channels the same way the transport
+        // ones are clamped, so a fit dipping below zero cannot hand transport
+        // a negative reaction rate.
+        for (int j = 0; j < 6; ++j)
+          if (dep[j] < 0.0)
+            dep[j] = 0.0;
+      } else {
+        // NOT split: MT102 is the only disappearance channel here, so the
+        // exact difference IS (n,gamma) and nothing else is carried. Filled
+        // here rather than left to the caller so that passing `dep` always
+        // returns a correct answer whichever path the nuclide takes.
+        dep[0] = sig_a - sig_f;
+        if (dep[0] < 0.0)
+          dep[0] = 0.0;
+        for (int j = 1; j < 6; ++j)
+          dep[j] = 0.0;
+      }
+    }
     return std::make_tuple(sig_s, sig_a, sig_f);
   }
 

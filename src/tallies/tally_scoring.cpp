@@ -568,8 +568,32 @@ double get_nuclide_xs(const Particle& p, int i_nuclide, int score_bin)
     }
     return xs;
   } else {
-    // For multipole, calculate (n,gamma) from other reactions
-    return rx.mt_ == N_GAMMA ? micro.absorption - micro.fission : 0.0;
+    // MULTIPOLE: no energy-grid index here, so the tabulated reaction data
+    // cannot be interpolated. The six DEPLETION_RX reactions ARE available
+    // from the pole representation -- Nuclide::calculate_xs now fills
+    // micro.reaction across both the resolved and fast segments -- so serve
+    // them from there instead of returning zero.
+    for (int j = 0; j < DEPLETION_RX.size(); ++j) {
+      if (rx.mt_ == DEPLETION_RX[j])
+        return micro.reaction[j];
+    }
+    // Any OTHER MT -- MT105 (n,t), an inelastic level, ... -- is not carried
+    // per-channel in micro and would silently score zero. That silence is
+    // exactly what hid the depletion defect: a zero score is
+    // indistinguishable from a genuinely zero reaction rate. Say it once,
+    // loudly, rather than returning a number nobody can audit.
+    static bool warned_mt_multipole = false;
+    if (!warned_mt_multipole) {
+      warned_mt_multipole = true;
+      warning("Tally scores MT" + std::to_string(rx.mt_) +
+              " for a nuclide evaluated with windowed multipole data, where "
+              "only the six depletion reactions are available per-MT. This "
+              "score will be ZERO and the tally is not trustworthy. Restrict "
+              "the tally to (n,gamma), (n,p), (n,alpha), (n,2n), (n,3n), "
+              "(n,4n), fission, absorption, elastic or total, or run this "
+              "nuclide from ACE data.");
+    }
+    return 0.0;
   }
   return 0.0;
 }

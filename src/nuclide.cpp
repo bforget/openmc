@@ -705,10 +705,20 @@ void Nuclide::calculate_xs(
 
   // Evaluate multipole or interpolate
   if (use_mp) {
-    // Call multipole kernel
+    // Call multipole kernel. When depletion rates are wanted AND this
+    // nuclide's disappearance lump holds more than MT102, the same call also
+    // fills micro.reaction from the per-MT residues and curvefit -- reusing
+    // the Faddeeva values and the window index it just computed, so no second
+    // w(z) and no second window search. Zeroed first because evaluate()
+    // accumulates into it.
+    const bool want_dep = simulation::need_depletion_rx;
+    if (want_dep) {
+      for (double& r : micro.reaction)
+        r = 0.0;
+    }
     double sig_s, sig_a, sig_f;
-    std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(p.E(), p.sqrtkT());
-
+    std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(
+      p.E(), p.sqrtkT(), want_dep ? micro.reaction : nullptr);
 
     micro.total = sig_s + sig_a;
     micro.elastic = sig_s;
@@ -717,15 +727,10 @@ void Nuclide::calculate_xs(
     micro.nu_fission =
       fissionable_ ? sig_f * this->nu(p.E(), EmissionMode::total) : 0.0;
 
-    if (simulation::need_depletion_rx) {
-      // Only non-zero reaction is (n,gamma)
-      micro.reaction[0] = sig_a - sig_f;
-
-      // Set all other reaction cross sections to zero
-      for (int i = 1; i < DEPLETION_RX.size(); ++i) {
-        micro.reaction[i] = 0.0;
-      }
-    }
+    // micro.reaction was filled by evaluate() above, either from the per-MT
+    // residues and curvefit or -- for the 441 nuclides whose only
+    // disappearance channel is MT102 -- as the exact (absorption - fission)
+    // difference. Nothing further to do here.
 
     /*
      * index_temp, index_grid, and interp_factor are used only in the
@@ -814,7 +819,13 @@ void Nuclide::calculate_xs(
     // the flight path reads the grid. Defer the binary search: most flight
     // lookups never collide in this nuclide, so it is pure saving;
     // ensure_grid_index() recomputes it on demand.
-    bool lazy_grid = use_fast_mp && !simulation::need_depletion_rx;
+    // The depletion exception is GONE: the fast segment now serves
+    // micro.reaction from its own poles (evaluate_fast's dep argument), so a
+    // depletion run no longer needs the tabulated reaction data and no longer
+    // has to force the grid search on every fast lookup. That restores the
+    // saving described above for exactly the runs that were paying most for
+    // losing it.
+    bool lazy_grid = use_fast_mp;
 
     int i_grid = 0;
     if (lazy_grid) {
@@ -879,8 +890,15 @@ void Nuclide::calculate_xs(
                           f * xs(i_grid + 1, XS_PHOTON_PROD);
     }
 
-    // Depletion-related reactions
-    if (simulation::need_depletion_rx) {
+    // Depletion-related reactions.
+    //
+    // Skipped entirely under fast multipole: evaluate_fast filled
+    // micro.reaction from the pole representation below, and reading the ACE
+    // tables here would both overwrite it and mix sources -- transport from
+    // poles, depletion from tabulated data. This is also what allows
+    // lazy_grid above to stay on during a depletion run, since i_grid/f are
+    // then never needed.
+    if (simulation::need_depletion_rx && !use_fast_mp) {
       // Initialize all reaction cross sections to zero
       for (double& xs_i : micro.reaction) {
         xs_i = 0.0;
@@ -925,8 +943,17 @@ void Nuclide::calculate_xs(
     // URR ptables on, calculate_urr_xs multiplies the band factors onto
     // these pole values (see the pole_base gate there).
     if (use_fast_mp) {
+      // Depletion channels come from the SAME call, off the same window and
+      // the same pole reciprocals, instead of from the ACE reaction tables
+      // (whose block above is skipped for exactly this reason). Zeroed first
+      // because evaluate_fast accumulates.
+      if (simulation::need_depletion_rx) {
+        for (double& r : micro.reaction)
+          r = 0.0;
+      }
       double sig_t, sig_a, sig_f;
-      std::tie(sig_t, sig_a, sig_f) = multipole_->evaluate_fast(p.E());
+      std::tie(sig_t, sig_a, sig_f) = multipole_->evaluate_fast(
+        p.E(), simulation::need_depletion_rx ? micro.reaction : nullptr);
       micro.total = sig_t;
       // LAZY ELASTIC. The flight needs total/absorption/fission only --
       // elastic is not needed until a collision samples a channel -- so the

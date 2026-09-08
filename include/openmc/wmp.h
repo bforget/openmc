@@ -72,9 +72,17 @@ public:
   //!
   //! \param E Incident neutron energy in [eV]
   //! \param sqrtkT Square root of temperature times Boltzmann constant
+  //! \param dep When non-null, ALSO fills the six DEPLETION_RX channels --
+  //!   (n,gamma) (n,p) (n,alpha) (n,2n) (n,3n) (n,4n), in that order -- from
+  //!   the per-MT residues and curvefit this library already carries
+  //!   (res_mt_, cf_mt_). It reuses the Faddeeva values the transport sweep
+  //!   just computed and the window index it just found, so depletion costs
+  //!   extra FMAs and one streaming read, never another w(z) and never
+  //!   another search. Slots the nuclide does not carry are left untouched.
   //! \return Tuple of elastic scattering, absorption, and fission cross
   //! sections in [b]
-  std::tuple<double, double, double> evaluate(double E, double sqrtkT) const;
+  std::tuple<double, double, double> evaluate(
+    double E, double sqrtkT, double* dep = nullptr) const;
 
   //! \brief Pull this nuclide's window block toward cache for energy E.
   //!
@@ -140,9 +148,16 @@ public:
   //! collision actually samples a channel, via evaluate_fast_elastic().
   //!
   //! \param E Incident neutron energy in [eV], seam < E <= fast_E_max_
+  //! \param dep When non-null, ALSO fills the six DEPLETION_RX channels from
+  //!   the per-channel residues and curvefit (fw_chan_res_, fw_chan_cf_) in
+  //!   the SAME window this call already located, reusing the pole
+  //!   reciprocals. This is what lets the fast range serve depletion from the
+  //!   poles instead of the ACE tables, and it is why the ACE grid search can
+  //!   stay deferred (lazy_grid) during a depletion run.
   //! \return Tuple of total, absorption (fission + disappearance), and
   //!         fission cross sections in [b]
-  std::tuple<double, double, double> evaluate_fast(double E) const;
+  std::tuple<double, double, double> evaluate_fast(
+    double E, double* dep = nullptr) const;
 
   //! \brief Elastic (MT2) alone in the fast segment -- the LAZY half of
   //!        evaluate_fast, resolved on demand at a collision.
@@ -229,6 +244,29 @@ public:
   vector<int> mts_;                              //!< resolved channel MTs
   tensor::Tensor<std::complex<double>> res_mt_;  //!< (n_pool, n_ch)
   tensor::Tensor<double> cf_mt_;                 //!< (n_win, n_cf, n_ch)
+
+  //! DEPLETION CHANNEL MAP, resolved segment. dep_ch_[j] is the index into
+  //! mts_ carrying DEPLETION_RX[j], or -1 when this nuclide has no such
+  //! channel here. Built once at load so the hot loop touches only the two or
+  //! three channels that exist rather than scanning all of mts_.
+  //!
+  //! dep_needs_split_ is the cheap out. (n,gamma) = absorption - fission is
+  //! EXACT whenever MT102 is the only disappearance channel the resolved
+  //! segment carries, which is true for 441 of the 557 shipped nuclides. Only
+  //! the remaining 116 -- those also carrying MT103/105/107, B-10 among them
+  //! -- need the per-MT split, so the rest keep the original code path with
+  //! no added work at all.
+  int dep_ch_[6] {-1, -1, -1, -1, -1, -1};
+  bool dep_needs_split_ {false};
+  int fast_dep_ch_[6] {-1, -1, -1, -1, -1, -1};
+
+  //! LOW-ENERGY depletion coefficients, [n_cf][6] interleaved by slot.
+  //! read_lowe_segment collapses its per-MT curvefit to the transport triplet
+  //! and discards the rest, but this segment is where a thermal (n,alpha) or
+  //! (n,p) lives -- B-10's whole depletion sits below the resolved seam. Only
+  //! the six DEPLETION_RX slots are kept, so this costs a few hundred bytes.
+  vector<double> lowe_dep_cf_;
+  int lowe_dep_ch_[6] {-1, -1, -1, -1, -1, -1};
 
   //! Fast-segment per-window curvefit, collapsed to four slots and
   //! interleaved per window. When fast_merge_sct_ the slot order is
