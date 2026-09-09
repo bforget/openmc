@@ -999,6 +999,11 @@ void Nuclide::calculate_xs(
 
   micro.last_E = p.E();
   micro.last_sqrtkT = p.sqrtkT();
+  // reaction[] is populated above only when need_depletion_rx is set. Marking
+  // that here lets an MT tally under multipole fill it lazily ONCE per lookup
+  // (see get_nuclide_xs) instead of re-evaluating the poles for every score.
+  // This assignment must stay with last_E: both describe the same cache.
+  micro.reaction_valid = simulation::need_depletion_rx;
   {
   }
 }

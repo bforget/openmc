@@ -163,6 +163,18 @@ struct NuclideMicroXS {
   // macroscopic cache)
   double reaction[DEPLETION_RX.size()];
 
+  //! Is reaction[] populated for the CURRENT (last_E, last_sqrtkT)?
+  //!
+  //! Nuclide::calculate_xs fills reaction[] only when need_depletion_rx is
+  //! set, so an MT tally outside a depletion run would otherwise read a stale
+  //! array. Under multipole, get_nuclide_xs fills it lazily on the first MT
+  //! score of a lookup and every later score reuses it -- ONE pole evaluation
+  //! per nuclide per lookup instead of one per score. All six channels fall
+  //! out of the same sweep regardless (they share the Faddeeva values in the
+  //! resolved range, and the fast range evaluates none), so calling per score
+  //! discarded five results out of six and cost ~15x.
+  mutable bool reaction_valid {false};
+
   // Indicies and factors needed to compute cross sections from the data tables
   int index_grid;       //!< Index on nuclide energy grid
   int index_temp;       //!< Temperature index for nuclide

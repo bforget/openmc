@@ -538,7 +538,20 @@ double get_nuclide_xs(const Particle& p, int i_nuclide, int score_bin)
   }
 
   auto i_temp = micro.index_temp;
-  if (i_temp >= 0) { // Can be false due to multipole
+  // WHICH PATH SERVES THIS SCORE.
+  //
+  // index_temp < 0 marks the RESOLVED multipole branch. The FAST branch does
+  // NOT set that -- it leaves a valid index_temp while deferring the grid
+  // search (lazy_grid), so index_grid stays C_NONE. A score falling through
+  // to the tabulated path below would then interpolate rx.xs(micro) on an
+  // invalid index: measured 2026-09-09 as every (n,2n)/(n,3n) reading exactly
+  // zero, threshold (n,p)/(n,alpha) zero, and U-238 (n,gamma) 5.8% low
+  // because its fast-range share was lost.
+  //
+  // Both conditions therefore mean "the poles, not the tables", which is also
+  // what keeps tallies on the same data transport used.
+  const bool from_poles = (i_temp < 0) || (micro.index_grid == C_NONE);
+  if (!from_poles) {
     // Get index on energy grid and interpolation factor
     auto i_grid = micro.index_grid;
     auto f = micro.interp_factor;
@@ -574,8 +587,37 @@ double get_nuclide_xs(const Particle& p, int i_nuclide, int score_bin)
     // micro.reaction across both the resolved and fast segments -- so serve
     // them from there instead of returning zero.
     for (int j = 0; j < DEPLETION_RX.size(); ++j) {
-      if (rx.mt_ == DEPLETION_RX[j])
+      if (rx.mt_ != DEPLETION_RX[j])
+        continue;
+      // micro.reaction is ONLY populated when need_depletion_rx is set --
+      // Nuclide::calculate_xs skips that work otherwise. Reading it
+      // unconditionally returned an unfilled array, which reported U-238
+      // (n,gamma) 96% low and B-10 (n,alpha) as zero in a plain tally run
+      // (measured 2026-09-09).
+      //
+      // Fill it ONCE per lookup instead. One sweep produces all six channels
+      // -- they share the Faddeeva values in the resolved range, and the fast
+      // range evaluates none -- so evaluating per score repeated the window
+      // search and every pole's w(z) to keep one channel of six, at ~15x the
+      // cost (Ben, 2026-09-09: "all MTs should be sharing the W(z) ... why the
+      // slowdown?").
+      if (simulation::need_depletion_rx || micro.reaction_valid)
         return micro.reaction[j];
+      if (nuc.multipole_) {
+        auto& m = const_cast<NuclideMicroXS&>(micro);
+        for (double& r : m.reaction)
+          r = 0.0;
+        const double E = p.E();
+        const auto& mp = *nuc.multipole_;
+        if (mp.fast_present_ && E > mp.E_max_ && E <= mp.fast_E_max_) {
+          mp.evaluate_fast(E, m.reaction);
+        } else {
+          mp.evaluate(E, p.sqrtkT(), m.reaction);
+        }
+        m.reaction_valid = true;
+        return micro.reaction[j];
+      }
+      return 0.0;
     }
     // Any OTHER MT -- MT105 (n,t), an inelastic level, ... -- is not carried
     // per-channel in micro and would silently score zero. That silence is
