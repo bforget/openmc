@@ -576,27 +576,42 @@ void WindowedMultipole::read_fast_segment(hid_t group)
           // MT16, which turns on at 17.91 MeV: the flight read 13% low below
           // that and exactly right above it (2026-08-18).
           //
-          // EDGE TOLERANCE. _elo/_ehi are rebuilt by SQUARING fast_bounds_,
-          // so a clamp sitting exactly ON a window edge can miss by an ulp and
-          // silently drop that channel's entire curvefit from the window.
-          // Pu-240: MT2 turns on at 5700 eV, the fast segment starts at
-          // 5700 eV, and sqrt(5700)^2 == 5699.999999999999, so e_on <= _elo
-          // was FALSE. Elastic then lost its background in fast window 0 and
+          // EDGE TOLERANCE, for the ELASTIC-ONLY slot 3 ONLY. _elo/_ehi are
+          // rebuilt by SQUARING fast_bounds_, so a clamp sitting exactly on a
+          // window edge can miss the exact test by an ulp. Pu-240: MT2 turns
+          // on at 5700 eV, the fast segment starts at 5700 eV, and
+          // sqrt(5700)^2 == 5699.999999999999, so e_on <= _elo was FALSE.
+          // Slot 3 then lost its background in fast window 0 and
           // evaluate_fast_elastic returned pole-only, ~2.9 b against ~14.5 b
           // (-79%) over 5700-11400 eV. Pu-239 (5000 eV) and U-238 (20000 eV)
-          // round-trip exactly, which is why this looked nuclide-specific.
+          // round-trip exactly, hence the nuclide-specific appearance.
+          //
+          // The COLLAPSED FLIGHT groups (slots 0/1/2) keep the ORIGINAL exact
+          // gate. They were already correct without this channel -- measured
+          // on Pu-240 window 0: total -0.025%, scatter -0.005%, absorption
+          // -0.248% -- so loosening the gate for them double-counts the
+          // background: total +73%, scatter +74%, absorption +64%, fission
+          // -88%, and ~-500 pcm in an SFR pin cell. Slot 3 is a separate
+          // consumer (evaluate_fast_elastic) and is the only one that was
+          // short.
           constexpr double EDGE_RTOL = 1.0e-9;
-          if (!(e_on[c] <= _elo * (1.0 + EDGE_RTOL) &&
-                e_off[c] >= _ehi * (1.0 - EDGE_RTOL)))
+          const bool spans_exact = (e_on[c] <= _elo && e_off[c] >= _ehi);
+          const bool spans_tol = (e_on[c] <= _elo * (1.0 + EDGE_RTOL) &&
+                                  e_off[c] >= _ehi * (1.0 - EDGE_RTOL));
+          // Elastic-only copy, tolerant gate. Superset of spans_exact, so
+          // windows that already passed are unchanged.
+          if (fast_merge_sct_ && kind[c] == 3 && spans_tol)
+            d[3] += cf(w, k, c);
+          if (!spans_exact)
             continue;
           const double v = cf(w, k, c);
           // Merged slot order is [scatter, fission, disappearance, ELASTIC];
-          // elastic lands in BOTH slot 0 (summed with other-scatter, for the
-          // flight) and slot 3 (alone, for evaluate_fast_elastic).
+          // elastic lands in slot 0 (summed with other-scatter, for the
+          // flight); slot 3 (alone, for evaluate_fast_elastic) is filled
+          // above under the tolerant gate.
           switch (kind[c]) {
           case 3:
             d[0] += v;                              // elastic -> scatter
-            if (fast_merge_sct_) d[3] += v;         // elastic-only copy
             break;
           case 1: d[1] += v; break;                 // fission
           case 2: d[2] += v; break;                 // disappearance
