@@ -575,7 +575,19 @@ void WindowedMultipole::read_fast_segment(hid_t group)
           // across the whole window. Ne-20 window 25 (13.79-20 MeV) holds
           // MT16, which turns on at 17.91 MeV: the flight read 13% low below
           // that and exactly right above it (2026-08-18).
-          if (!(e_on[c] <= _elo && e_off[c] >= _ehi))
+          //
+          // EDGE TOLERANCE. _elo/_ehi are rebuilt by SQUARING fast_bounds_,
+          // so a clamp sitting exactly ON a window edge can miss by an ulp and
+          // silently drop that channel's entire curvefit from the window.
+          // Pu-240: MT2 turns on at 5700 eV, the fast segment starts at
+          // 5700 eV, and sqrt(5700)^2 == 5699.999999999999, so e_on <= _elo
+          // was FALSE. Elastic then lost its background in fast window 0 and
+          // evaluate_fast_elastic returned pole-only, ~2.9 b against ~14.5 b
+          // (-79%) over 5700-11400 eV. Pu-239 (5000 eV) and U-238 (20000 eV)
+          // round-trip exactly, which is why this looked nuclide-specific.
+          constexpr double EDGE_RTOL = 1.0e-9;
+          if (!(e_on[c] <= _elo * (1.0 + EDGE_RTOL) &&
+                e_off[c] >= _ehi * (1.0 - EDGE_RTOL)))
             continue;
           const double v = cf(w, k, c);
           // Merged slot order is [scatter, fission, disappearance, ELASTIC];
