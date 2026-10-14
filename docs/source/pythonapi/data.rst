@@ -23,6 +23,10 @@ and product yields.
     Decay
     FissionProductYields
     WindowedMultipole
+    GlobalPoleMultipole
+    LowEnergySegment
+    ResolvedSegment
+    FastSegment
     ProbabilityTables
 
 The following classes are used for storing atomic data (incident photon cross

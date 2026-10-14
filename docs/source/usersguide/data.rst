@@ -280,6 +280,17 @@ The `official ENDF/B-VII.1 HDF5 library
 multipole library, so if you are using this library, the windowed multipole data
 will already be available to you.
 
+Two library formats are supported (see :ref:`io_data_wmp`). Version 2
+libraries extend the multipole representation over the whole energy range,
+with a low-energy segment below the resolved resonances and a fast segment
+covering the unresolved and fast range, and carry residues per reaction so
+that depletion reaction rates can be computed from the poles. Version 1
+libraries, such as those from the `WMP_Library
+<https://github.com/mit-crpg/WMP_Library>`_ repository, continue to work and
+cover only the resolved resonance range. Both can be inspected with
+:meth:`openmc.data.WindowedMultipole.from_hdf5`, which returns a
+:class:`openmc.data.GlobalPoleMultipole` for version 2 data.
+
 .. _create_mgxs:
 
 -------------------------

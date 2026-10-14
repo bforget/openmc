@@ -11,7 +11,8 @@ from scipy.signal import find_peaks
 import openmc.checkvalue as cv
 from ..exceptions import DataError
 from ..mixin import EqualityMixin
-from . import WMP_VERSION, WMP_VERSION_MAJOR
+from . import (WMP_VERSION, WMP_VERSION_MAJOR, WMP_VERSION_LEGACY,
+               WMP_VERSION_MAJOR_LEGACY)
 from .data import K_BOLTZMANN
 from .neutron import IncidentNeutron
 from .resonance import ResonanceRange
@@ -139,6 +140,43 @@ def _broaden_wmp_polynomials(E, dopp, n):
             factors[i+2] = factors[i]*(E + (1.0 + 2.0 * i) * half_inv_dopp2)
 
     return factors
+
+
+def _check_wmp_version(h5file):
+    """Return the major version of a WMP library file, validating it."""
+    if 'version' not in h5file.attrs:
+        raise DataError(
+            'WMP data does not indicate a version. Your installation of the '
+            f'OpenMC Python API expects version {WMP_VERSION_MAJOR}.x or '
+            f'{WMP_VERSION_MAJOR_LEGACY}.x data.')
+    major, minor = h5file.attrs['version']
+    if major not in (WMP_VERSION_MAJOR, WMP_VERSION_MAJOR_LEGACY):
+        raise DataError(
+            f'WMP data format uses version {major}.{minor} whereas your '
+            'installation of the OpenMC Python API expects version '
+            f'{WMP_VERSION_MAJOR}.x or {WMP_VERSION_MAJOR_LEGACY}.x.')
+    return int(major)
+
+
+def _channel_kind(mt):
+    """Transport group of a reaction channel: 'elastic', 'fission',
+    'disappearance', or 'other' (inelastic and (n,xn), counted as scattering).
+    """
+    if mt == 2:
+        return 'elastic'
+    if mt == 18:
+        return 'fission'
+    if mt == 101 or 102 <= mt <= 117:
+        return 'disappearance'
+    return 'other'
+
+
+def _basis_factors(E, T, sqrtAWR, n):
+    """Curvefit basis E^(k/2-1), Doppler broadened when T > 0."""
+    if T > 0.0:
+        dopp = sqrtAWR / sqrt(K_BOLTZMANN * T)
+        return _broaden_wmp_polynomials(E, dopp, max(n, 3))[:n]
+    return E**(0.5*np.arange(n) - 1.0)
 
 
 def _vectfit_xs(energy, ce_xs, mts, rtol=1e-3, atol=1e-5, orders=None,
@@ -936,9 +974,10 @@ class WindowedMultipole(EqualityMixin):
 
         Returns
         -------
-        openmc.data.WindowedMultipole
+        openmc.data.WindowedMultipole or openmc.data.GlobalPoleMultipole
             Resonant cross sections represented in the windowed multipole
-            format.
+            format. Version 2 libraries are returned as
+            :class:`openmc.data.GlobalPoleMultipole`.
 
         """
 
@@ -948,22 +987,15 @@ class WindowedMultipole(EqualityMixin):
         else:
             h5file = h5py.File(str(group_or_filename), 'r')
             need_to_close = True
-
-            # Make sure version matches
-            if 'version' in h5file.attrs:
-                major, minor = h5file.attrs['version']
-                if major != WMP_VERSION_MAJOR:
-                    raise DataError(
-                        'WMP data format uses version {}. {} whereas your '
-                        'installation of the OpenMC Python API expects version '
-                        '{}.x.'.format(major, minor, WMP_VERSION_MAJOR))
-            else:
-                raise DataError(
-                    'WMP data does not indicate a version. Your installation of '
-                    'the OpenMC Python API expects version {}.x data.'
-                    .format(WMP_VERSION_MAJOR))
-
             group = list(h5file.values())[0]
+
+        # Dispatch on the file format version
+        major = _check_wmp_version(group.file)
+        if major == WMP_VERSION_MAJOR:
+            out = GlobalPoleMultipole.from_hdf5(group)
+            if need_to_close:
+                h5file.close()
+            return out
 
         name = group.name[1:]
         out = cls(name)
@@ -1283,7 +1315,7 @@ class WindowedMultipole(EqualityMixin):
         # Open file and write version.
         with h5py.File(str(path), mode, libver=libver) as f:
             f.attrs['filetype'] = np.bytes_('data_wmp')
-            f.attrs['version'] = np.array(WMP_VERSION)
+            f.attrs['version'] = np.array(WMP_VERSION_LEGACY)
 
             g = f.create_group(self.name)
 
@@ -1299,3 +1331,537 @@ class WindowedMultipole(EqualityMixin):
             g.create_dataset('broaden_poly',
                              data=self.broaden_poly.astype(np.int8))
             g.create_dataset('curvefit', data=self.curvefit)
+
+
+class LowEnergySegment(EqualityMixin):
+    """Low-energy segment of a version 2 windowed multipole library.
+
+    Below the resolved range the cross section is a curvefit alone, in the
+    basis :math:`E^{k/2-1}`, which Doppler broadens in closed form.
+
+    Attributes
+    ----------
+    E_min : float
+        Lowest energy in eV the segment is valid for
+    E_max : float
+        Highest energy in eV the segment is valid for
+    mts : np.ndarray
+        ENDF MT number of each channel
+    curvefit : np.ndarray
+        Curvefit coefficients indexed by (term, channel)
+
+    """
+    def __init__(self):
+        self.E_min = None
+        self.E_max = None
+        self.mts = None
+        self.curvefit = None
+
+    @classmethod
+    def from_hdf5(cls, group):
+        out = cls()
+        out.E_min = float(group['E_min'][()])
+        out.E_max = float(group['E_max'][()])
+        out.mts = group['mts'][()].astype(int)
+        out.curvefit = group['curvefit'][()]
+        if out.curvefit.shape != (out.curvefit.shape[0], out.mts.size):
+            raise ValueError("WMP low-energy curvefit shape is not consistent "
+                             "with the MT list")
+        return out
+
+    def to_hdf5(self, group):
+        group.create_dataset('E_min', data=np.array(self.E_min))
+        group.create_dataset('E_max', data=np.array(self.E_max))
+        group.create_dataset('mts', data=np.asarray(self.mts, dtype=np.int64))
+        group.create_dataset('curvefit', data=self.curvefit)
+
+    def evaluate(self, E, T, sqrtAWR):
+        """Cross section of each channel at energy E [eV] and temperature T
+        [K], as an array parallel to ``mts``."""
+        fac = _basis_factors(E, T, sqrtAWR, self.curvefit.shape[0])
+        return fac @ self.curvefit
+
+
+class ResolvedSegment(EqualityMixin):
+    """Resolved segment of a version 2 windowed multipole library.
+
+    Poles are stored in one table; each window points at a contiguous range
+    of it and adds a curvefit background in the basis :math:`E^{k/2-1}`.
+
+    Attributes
+    ----------
+    E_min : float
+        Lowest energy in eV the segment is valid for
+    E_max : float
+        Highest energy in eV the segment is valid for
+    mts : np.ndarray
+        ENDF MT number of each channel
+    poles : np.ndarray
+        Complex poles in sqrt(eV)
+    residues : np.ndarray
+        Complex residues indexed by (pole, channel)
+    win_pole_start : np.ndarray
+        Index of the first pole of each window
+    win_pole_end : np.ndarray
+        One past the index of the last pole of each window
+    sqrtE_bounds : np.ndarray
+        Window boundaries in sqrt(eV), one more than the number of windows
+    curvefit : np.ndarray or None
+        Curvefit coefficients indexed by (window, term, channel)
+    grid_uniform : bool
+        Whether the windows are uniformly spaced in sqrt(E)
+    grid_u_lowe : float or None
+        Lower bound of the first window in sqrt(eV) when uniform
+    grid_spacing : float or None
+        Window width in sqrt(eV) when uniform
+
+    """
+    def __init__(self):
+        self.E_min = None
+        self.E_max = None
+        self.mts = None
+        self.poles = None
+        self.residues = None
+        self.win_pole_start = None
+        self.win_pole_end = None
+        self.sqrtE_bounds = None
+        self.curvefit = None
+        self.grid_uniform = False
+        self.grid_u_lowe = None
+        self.grid_spacing = None
+
+    @property
+    def n_windows(self):
+        return self.win_pole_start.size
+
+    @classmethod
+    def from_hdf5(cls, group):
+        out = cls()
+        out.E_min = float(group['E_min'][()])
+        out.E_max = float(group['E_max'][()])
+        out.mts = group['mts'][()].astype(int)
+        out.poles = group['poles'][()]
+        out.residues = group['residues'][()]
+        out.win_pole_start = group['win_pole_start'][()].astype(int)
+        out.win_pole_end = group['win_pole_end'][()].astype(int)
+        out.sqrtE_bounds = group['sqrtE_bounds'][()]
+        if 'curvefit' in group:
+            out.curvefit = group['curvefit'][()]
+        if 'grid_uniform' in group.attrs:
+            out.grid_uniform = bool(group.attrs['grid_uniform'])
+            out.grid_u_lowe = float(group.attrs['grid_u_lowe'])
+            out.grid_spacing = float(group.attrs['grid_spacing'])
+        n_win = out.n_windows
+        if out.win_pole_end.size != n_win or out.sqrtE_bounds.size != n_win + 1:
+            raise ValueError("WMP resolved window arrays have inconsistent "
+                             "shapes")
+        if out.residues.shape != (out.poles.size, out.mts.size):
+            raise ValueError("WMP resolved residues shape is not consistent "
+                             "with the poles and MT list")
+        return out
+
+    def to_hdf5(self, group):
+        group.create_dataset('E_min', data=np.array(self.E_min))
+        group.create_dataset('E_max', data=np.array(self.E_max))
+        group.create_dataset('mts', data=np.asarray(self.mts, dtype=np.int64))
+        group.create_dataset('poles', data=np.asarray(self.poles, dtype=complex))
+        group.create_dataset('residues',
+                             data=np.asarray(self.residues, dtype=complex))
+        group.create_dataset('win_pole_start',
+                             data=np.asarray(self.win_pole_start, np.int64))
+        group.create_dataset('win_pole_end',
+                             data=np.asarray(self.win_pole_end, np.int64))
+        group.create_dataset('sqrtE_bounds', data=self.sqrtE_bounds)
+        if self.curvefit is not None:
+            group.create_dataset('curvefit', data=self.curvefit)
+        if self.grid_uniform:
+            group.attrs['grid_uniform'] = np.int32(1)
+            group.attrs['grid_u_lowe'] = float(self.grid_u_lowe)
+            group.attrs['grid_spacing'] = float(self.grid_spacing)
+
+    def window(self, sqrtE):
+        """Index of the window containing sqrt(E)."""
+        n_win = self.n_windows
+        if self.grid_uniform:
+            i = int((sqrtE - self.grid_u_lowe) / self.grid_spacing)
+        else:
+            i = int(np.searchsorted(self.sqrtE_bounds, sqrtE, 'right')) - 1
+        return min(max(i, 0), n_win - 1)
+
+    def evaluate(self, E, T, sqrtAWR):
+        """Cross section of each channel at energy E [eV] and temperature T
+        [K], as an array parallel to ``mts``."""
+        u = sqrt(E)
+        w = self.window(u)
+        xs = np.zeros(self.mts.size)
+        xi = sqrt(K_BOLTZMANN * T) / sqrtAWR if T > 0.0 else 0.0
+        for i in range(self.win_pole_start[w], self.win_pole_end[w]):
+            p = self.poles[i]
+            r = self.residues[i]
+            if xi == 0.0 or p.real == 0.0:
+                # 0 K form; the 1/v pole is invariant under broadening
+                xs += (r / (u - p)).real
+            else:
+                z = (p - u) / xi
+                b = ((u + p) + p*p*1j*sqrt(pi)/xi*_faddeeva(z)) / E
+                xs += (r * b).real
+        if self.curvefit is not None:
+            fac = _basis_factors(E, T, sqrtAWR, self.curvefit.shape[1])
+            xs += fac @ self.curvefit[w]
+        return xs
+
+
+class FastSegment(EqualityMixin):
+    """Fast segment of a version 2 windowed multipole library.
+
+    Covers the unresolved and fast range as an unbroadened pole sum. Each
+    window points at a contiguous range of the pole table and adds its own
+    external poles and curvefit. Each channel is active only between its
+    threshold energies.
+
+    Attributes
+    ----------
+    E_min : float
+        Lowest energy in eV the segment is valid for
+    E_max : float
+        Highest energy in eV the segment is valid for
+    mts : np.ndarray
+        ENDF MT number of each channel
+    mt_E_on : np.ndarray
+        Energy in eV below which each channel is zero
+    mt_E_off : np.ndarray
+        Energy in eV above which each channel is zero
+    poles : np.ndarray
+        Complex poles in sqrt(eV)
+    residues : np.ndarray
+        Complex residues indexed by (pole, channel)
+    win_pole_start : np.ndarray
+        Index of the first pole of each window
+    win_pole_end : np.ndarray
+        One past the index of the last pole of each window
+    sqrtE_bounds : np.ndarray
+        Window boundaries in sqrt(eV), one more than the number of windows
+    ext_poles : np.ndarray
+        Complex external poles indexed by (window, external pole)
+    ext_residues : np.ndarray
+        Complex external residues indexed by (window, external pole, channel)
+    curvefit : np.ndarray or None
+        Curvefit coefficients indexed by (window, term, channel)
+
+    """
+    def __init__(self):
+        self.E_min = None
+        self.E_max = None
+        self.mts = None
+        self.mt_E_on = None
+        self.mt_E_off = None
+        self.poles = None
+        self.residues = None
+        self.win_pole_start = None
+        self.win_pole_end = None
+        self.sqrtE_bounds = None
+        self.ext_poles = None
+        self.ext_residues = None
+        self.curvefit = None
+
+    @property
+    def n_windows(self):
+        return self.win_pole_start.size
+
+    @classmethod
+    def from_hdf5(cls, group):
+        out = cls()
+        out.E_min = float(group['E_min'][()])
+        out.E_max = float(group['E_max'][()])
+        out.mts = group['mts'][()].astype(int)
+        out.mt_E_on = group['mt_E_on'][()]
+        out.mt_E_off = group['mt_E_off'][()]
+        out.poles = group['poles'][()]
+        out.residues = group['residues'][()]
+        out.win_pole_start = group['win_pole_start'][()].astype(int)
+        out.win_pole_end = group['win_pole_end'][()].astype(int)
+        out.sqrtE_bounds = group['sqrtE_bounds'][()]
+        out.ext_poles = group['ext_poles'][()]
+        out.ext_residues = group['ext_residues'][()]
+        if 'curvefit' in group:
+            out.curvefit = group['curvefit'][()]
+        n_win, n_ch = out.n_windows, out.mts.size
+        if (out.win_pole_end.size != n_win or out.sqrtE_bounds.size != n_win + 1
+                or out.ext_poles.shape[0] != n_win
+                or out.ext_residues.shape != out.ext_poles.shape + (n_ch,)
+                or out.residues.shape != (out.poles.size, n_ch)
+                or out.mt_E_on.size != n_ch or out.mt_E_off.size != n_ch):
+            raise ValueError("WMP fast segment arrays have inconsistent shapes")
+        return out
+
+    def to_hdf5(self, group):
+        group.create_dataset('E_min', data=np.array(self.E_min))
+        group.create_dataset('E_max', data=np.array(self.E_max))
+        group.create_dataset('mts', data=np.asarray(self.mts, dtype=np.int64))
+        group.create_dataset('mt_E_on', data=np.asarray(self.mt_E_on, float))
+        group.create_dataset('mt_E_off', data=np.asarray(self.mt_E_off, float))
+        group.create_dataset('poles', data=np.asarray(self.poles, dtype=complex))
+        group.create_dataset('residues',
+                             data=np.asarray(self.residues, dtype=complex))
+        group.create_dataset('win_pole_start',
+                             data=np.asarray(self.win_pole_start, np.int64))
+        group.create_dataset('win_pole_end',
+                             data=np.asarray(self.win_pole_end, np.int64))
+        group.create_dataset('sqrtE_bounds', data=self.sqrtE_bounds)
+        group.create_dataset('ext_poles',
+                             data=np.asarray(self.ext_poles, dtype=complex))
+        group.create_dataset('ext_residues',
+                             data=np.asarray(self.ext_residues, dtype=complex))
+        if self.curvefit is not None:
+            group.create_dataset('curvefit', data=self.curvefit)
+
+    def window(self, sqrtE):
+        """Index of the window containing sqrt(E)."""
+        i = int(np.searchsorted(self.sqrtE_bounds, sqrtE, 'right')) - 1
+        return min(max(i, 0), self.n_windows - 1)
+
+    def evaluate(self, E):
+        """Cross section of each channel at energy E [eV], as an array
+        parallel to ``mts``. The fast segment is not Doppler broadened."""
+        u = sqrt(E)
+        w = self.window(u)
+        s, e = self.win_pole_start[w], self.win_pole_end[w]
+        poles = np.concatenate((self.poles[s:e], self.ext_poles[w]))
+        residues = np.concatenate((self.residues[s:e], self.ext_residues[w]))
+        xs = (residues / (u - poles)[:, np.newaxis]).real.sum(axis=0)
+        if self.curvefit is not None:
+            fac = E**(0.5*np.arange(self.curvefit.shape[1]) - 1.0)
+            xs += fac @ self.curvefit[w]
+        xs[(E < self.mt_E_on) | (E > self.mt_E_off)] = 0.0
+        return xs
+
+
+class GlobalPoleMultipole(EqualityMixin):
+    """Cross sections in the version 2 windowed multipole format.
+
+    The energy range is split into up to three segments: an optional
+    low-energy segment carrying only a curvefit, a resolved segment of poles
+    broadened analytically, and an optional fast segment evaluated as an
+    unbroadened pole sum. Residues are stored per reaction channel (MT).
+
+    .. versionadded:: 0.16.0
+
+    Parameters
+    ----------
+    name : str
+        Name of the nuclide using the GNDS naming convention
+
+    Attributes
+    ----------
+    name : str
+        Name of the nuclide using the GNDS naming convention
+    sqrtAWR : float
+        Square root of the atomic weight ratio of the target nuclide
+    resolved : openmc.data.ResolvedSegment
+        Resolved resonance segment
+    lowe : openmc.data.LowEnergySegment or None
+        Low-energy segment
+    fast : openmc.data.FastSegment or None
+        Fast segment
+    E_min : float
+        Lowest energy in eV the library is valid for
+    E_max : float
+        Highest energy in eV the library is valid for
+    mts : np.ndarray
+        Sorted union of the MT numbers carried by all segments
+    fissionable : bool
+        Whether the resolved segment carries a fission channel
+
+    """
+    def __init__(self, name):
+        self.name = name
+        self.sqrtAWR = None
+        self.resolved = None
+        self.lowe = None
+        self.fast = None
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, name):
+        cv.check_type('name', name, str)
+        self._name = name
+
+    @property
+    def sqrtAWR(self):
+        return self._sqrtAWR
+
+    @sqrtAWR.setter
+    def sqrtAWR(self, sqrtAWR):
+        if sqrtAWR is not None:
+            cv.check_type('sqrtAWR', sqrtAWR, Real)
+            cv.check_greater_than('sqrtAWR', sqrtAWR, 0.0, equality=False)
+        self._sqrtAWR = sqrtAWR
+
+    @property
+    def E_min(self):
+        return self.lowe.E_min if self.lowe is not None else self.resolved.E_min
+
+    @property
+    def E_max(self):
+        return self.fast.E_max if self.fast is not None else self.resolved.E_max
+
+    @property
+    def mts(self):
+        mts = set(self.resolved.mts.tolist())
+        for seg in (self.lowe, self.fast):
+            if seg is not None:
+                mts.update(seg.mts.tolist())
+        return np.array(sorted(mts))
+
+    @property
+    def fissionable(self):
+        return 18 in self.resolved.mts
+
+    @classmethod
+    def from_hdf5(cls, group_or_filename):
+        """Construct a GlobalPoleMultipole object from an HDF5 group or file.
+
+        Parameters
+        ----------
+        group_or_filename : h5py.Group or str
+            HDF5 group containing multipole data. If given as a string, it is
+            assumed to be the filename for the HDF5 file, and the first group is
+            used to read from.
+
+        Returns
+        -------
+        openmc.data.GlobalPoleMultipole
+            Cross sections in the version 2 windowed multipole format
+
+        """
+        if isinstance(group_or_filename, h5py.Group):
+            group = group_or_filename
+            need_to_close = False
+        else:
+            h5file = h5py.File(str(group_or_filename), 'r')
+            need_to_close = True
+            group = list(h5file.values())[0]
+
+        if _check_wmp_version(group.file) != WMP_VERSION_MAJOR:
+            raise DataError(
+                f'WMP data for {group.name[1:]} is not in the version '
+                f'{WMP_VERSION_MAJOR}.x format; use '
+                'openmc.data.WindowedMultipole.from_hdf5 instead.')
+        if 'resolved' not in group:
+            raise DataError(
+                f'WMP data for {group.name[1:]} has no resolved segment.')
+
+        out = cls(group.name[1:])
+        out.resolved = ResolvedSegment.from_hdf5(group['resolved'])
+        out.sqrtAWR = float(group['resolved']['sqrtAWR'][()])
+        if 'lowe' in group:
+            out.lowe = LowEnergySegment.from_hdf5(group['lowe'])
+        if 'fast' in group:
+            out.fast = FastSegment.from_hdf5(group['fast'])
+
+        if need_to_close:
+            h5file.close()
+        return out
+
+    def export_to_hdf5(self, path, mode='a', libver='earliest'):
+        """Export windowed multipole data to an HDF5 file.
+
+        Parameters
+        ----------
+        path : str
+            Path to write HDF5 file to
+        mode : {'r+', 'w', 'x', 'a'}
+            Mode that is used to open the HDF5 file. This is the second argument
+            to the :class:`h5py.File` constructor.
+        libver : {'earliest', 'latest'}
+            Compatibility mode for the HDF5 file. 'latest' will produce files
+            that are less backwards compatible but have performance benefits.
+
+        """
+        with h5py.File(str(path), mode, libver=libver) as f:
+            f.attrs['filetype'] = np.bytes_('data_wmp')
+            f.attrs['version'] = np.array(WMP_VERSION)
+            g = f.create_group(self.name)
+            for name, seg in (('resolved', self.resolved), ('lowe', self.lowe),
+                              ('fast', self.fast)):
+                if seg is None:
+                    continue
+                sg = g.create_group(name)
+                sg.create_dataset('sqrtAWR', data=np.array(self.sqrtAWR))
+                seg.to_hdf5(sg)
+
+    def _evaluate(self, E, T):
+        """Per-channel cross sections at one energy, as a dict MT -> value."""
+        if self.lowe is not None and self.lowe.E_min <= E < self.lowe.E_max:
+            seg, xs = self.lowe, self.lowe.evaluate(E, T, self.sqrtAWR)
+        elif self.resolved.E_min <= E <= self.resolved.E_max:
+            seg, xs = self.resolved, self.resolved.evaluate(E, T, self.sqrtAWR)
+        elif self.fast is not None and self.resolved.E_max < E <= self.fast.E_max:
+            seg, xs = self.fast, self.fast.evaluate(E)
+        else:
+            return {}
+        return dict(zip(seg.mts.tolist(), xs))
+
+    def evaluate(self, E, T):
+        """Compute the cross section of every reaction channel.
+
+        Parameters
+        ----------
+        E : Real or Iterable of Real
+            Energy of the incident neutron in eV
+        T : Real
+            Temperature of the target in K
+
+        Returns
+        -------
+        dict
+            Maps each MT number to the microscopic cross section (a float or
+            an array matching ``E``) at the given energy and temperature.
+            Channels not carried by the segment covering an energy are zero.
+
+        """
+        energies = np.atleast_1d(np.asarray(E, dtype=float))
+        out = {mt: np.zeros(energies.shape) for mt in self.mts.tolist()}
+        for i, e in enumerate(energies.flat):
+            for mt, xs in self._evaluate(e, T).items():
+                out[mt].flat[i] = xs
+        if np.ndim(E) == 0:
+            out = {mt: float(v[0]) for mt, v in out.items()}
+        return out
+
+    def __call__(self, E, T):
+        """Compute scattering, absorption, and fission cross sections.
+
+        Scattering sums the elastic and all other scattering channels
+        (inelastic, (n,xn), MT5); absorption sums fission and the
+        disappearance channels MT101-117.
+
+        Parameters
+        ----------
+        E : Real or Iterable of Real
+            Energy of the incident neutron in eV.
+        T : Real
+            Temperature of the target in K.
+
+        Returns
+        -------
+        3-tuple of Real or 3-tuple of numpy.ndarray
+            Scattering, absorption, and fission microscopic cross sections
+            at the given energy and temperature.
+
+        """
+        per_mt = self.evaluate(E, T)
+        sig_s = sig_a = sig_f = 0.0
+        for mt, xs in per_mt.items():
+            kind = _channel_kind(mt)
+            if kind == 'fission':
+                sig_f = sig_f + xs
+                sig_a = sig_a + xs
+            elif kind == 'disappearance':
+                sig_a = sig_a + xs
+            else:
+                sig_s = sig_s + xs
+        return sig_s, sig_a, sig_f
