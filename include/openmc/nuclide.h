@@ -98,8 +98,10 @@ public:
   int Z_;            //!< Atomic number
   int A_;            //!< Mass number
   int metastable_;   //!< Metastable state
-  double awr_;       //!< Atomic weight ratio
-  int64_t index_;    //!< Index in the nuclides array
+  //! Target excitation [eV]; NaN if unavailable.
+  double excitation_energy_ {FP_UNSET};
+  double awr_;    //!< Atomic weight ratio
+  int64_t index_; //!< Index in the nuclides array
 
   // Temperature dependent cross section data
   vector<double> kTs_;                //!< temperatures in eV (k*T)
@@ -171,6 +173,16 @@ public:
   vector<int> index_inelastic_scatter_;
 
 private:
+  //! Locate the energy-grid interval containing E, using the logarithmic
+  //! union grid to narrow the binary search
+  //! \param[in] i_temp  Temperature index
+  //! \param[in] i_log_union  Index on the logarithmic union grid
+  //! \param[in] E  Energy in [eV]
+  //! \param[out] i_grid  Index on the nuclide energy grid
+  //! \param[out] f  Interpolation factor
+  void find_grid_index(
+    int i_temp, int i_log_union, double E, int& i_grid, double& f) const;
+
   void create_derived(
     const Function1D* prompt_photons, const Function1D* delayed_photons);
 

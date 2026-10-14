@@ -60,6 +60,9 @@ Nuclide::Nuclide(hid_t group, const vector<double>& temperature)
   read_attribute(group, "Z", Z_);
   read_attribute(group, "A", A_);
   read_attribute(group, "metastable", metastable_);
+  if (attribute_exists(group, "excitation_energy")) {
+    read_attribute(group, "excitation_energy", excitation_energy_);
+  }
   read_attribute(group, "atomic_weight_ratio", awr_);
 
   if (settings::run_mode == RunMode::VOLUME) {
@@ -740,7 +743,7 @@ void Nuclide::calculate_xs(
         i_temp = 0;
         break;
       }
-      if (kT > kTs_.back()) {
+      if (kT >= kTs_.back()) {
         i_temp = kTs_.size() - 1;
         break;
       }
@@ -758,7 +761,6 @@ void Nuclide::calculate_xs(
       break;
     }
 
-    const auto& grid {grid_[i_temp]};
     const auto& xs {xs_[i_temp]};
 
     micro.index_temp = i_temp;
@@ -775,25 +777,7 @@ void Nuclide::calculate_xs(
       micro.index_grid = C_NONE; // sentinel: deferred
       micro.interp_factor = 0.0;
     } else {
-      // Determine the energy grid index using a logarithmic mapping to
-      // reduce the energy range over which a binary search needs to be
-      // performed
-      if (p.E() < grid.energy.front()) {
-        i_grid = 0;
-      } else if (p.E() > grid.energy.back()) {
-        i_grid = grid.energy.size() - 2;
-      } else {
-        int i_low = grid.grid_index[i_log_union];
-        int i_high = grid.grid_index[i_log_union + 1] + 1;
-        i_grid = i_low + lower_bound_index(
-                           &grid.energy[i_low], &grid.energy[i_high], p.E());
-      }
-      // check for rare case where two energy points are the same
-      if (grid.energy[i_grid] == grid.energy[i_grid + 1])
-        ++i_grid;
-      // calculate interpolation factor
-      f = (p.E() - grid.energy[i_grid]) /
-          (grid.energy[i_grid + 1] - grid.energy[i_grid]);
+      find_grid_index(i_temp, i_log_union, p.E(), i_grid, f);
       micro.index_grid = i_grid;
       micro.interp_factor = f;
     }
@@ -934,38 +918,52 @@ void Nuclide::ensure_grid_index(Particle& p) const
   if (micro.index_grid != C_NONE || micro.index_temp == C_NONE)
     return;
 
-  int i_temp = micro.index_temp;
-  const auto& grid {grid_[i_temp]};
-
-  // Recompute the log-union index (as material.cpp does pre-calculate_xs)
+  // Recompute the log-union index as Material::calculate_neutron_xs does
   int neutron = ParticleType::neutron().transport_index();
   int i_log_union =
     std::log(p.E() / data::energy_min[neutron]) / simulation::log_spacing;
 
+  int i_temp = micro.index_temp;
   int i_grid;
-  if (p.E() < grid.energy.front()) {
-    i_grid = 0;
-  } else if (p.E() > grid.energy.back()) {
-    i_grid = grid.energy.size() - 2;
-  } else {
-    int i_low = grid.grid_index[i_log_union];
-    int i_high = grid.grid_index[i_log_union + 1] + 1;
-    i_grid = i_low + lower_bound_index(
-                       &grid.energy[i_low], &grid.energy[i_high], p.E());
-  }
-  if (grid.energy[i_grid] == grid.energy[i_grid + 1])
-    ++i_grid;
+  double f;
+  find_grid_index(i_temp, i_log_union, p.E(), i_grid, f);
   micro.index_grid = i_grid;
-  micro.interp_factor = (p.E() - grid.energy[i_grid]) /
-                        (grid.energy[i_grid + 1] - grid.energy[i_grid]);
+  micro.interp_factor = f;
+
   // Photon production was deferred as well; it is only read when photons are
   // transported
   if (settings::photon_transport) {
     const auto& xs {xs_[i_temp]};
-    double f = micro.interp_factor;
     micro.photon_prod = (1.0 - f) * xs(i_grid, XS_PHOTON_PROD) +
                         f * xs(i_grid + 1, XS_PHOTON_PROD);
   }
+}
+
+void Nuclide::find_grid_index(
+  int i_temp, int i_log_union, double E, int& i_grid, double& f) const
+{
+  const auto& grid {grid_[i_temp]};
+
+  // Determine the energy grid index using a logarithmic mapping to reduce the
+  // energy range over which a binary search needs to be performed
+  if (E < grid.energy.front()) {
+    i_grid = 0;
+  } else if (E > grid.energy.back()) {
+    i_grid = grid.energy.size() - 2;
+  } else {
+    int i_low = grid.grid_index[i_log_union];
+    int i_high = grid.grid_index[i_log_union + 1] + 1;
+    i_grid =
+      i_low + lower_bound_index(&grid.energy[i_low], &grid.energy[i_high], E);
+  }
+
+  // check for rare case where two energy points are the same
+  if (grid.energy[i_grid] == grid.energy[i_grid + 1])
+    ++i_grid;
+
+  // calculate interpolation factor
+  f =
+    (E - grid.energy[i_grid]) / (grid.energy[i_grid + 1] - grid.energy[i_grid]);
 }
 
 void Nuclide::calculate_sab_xs(int i_sab, double sab_frac, Particle& p)
