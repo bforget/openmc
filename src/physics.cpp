@@ -1,6 +1,5 @@
 #include "openmc/physics.h"
 
-
 #include "openmc/bank.h"
 #include "openmc/bremsstrahlung.h"
 #include "openmc/chain.h"
@@ -111,9 +110,8 @@ void sample_neutron_reaction(Particle& p)
   // Save which nuclide particle had collision with
   p.event_nuclide() = i_nuclide;
 
-  // Lazy grid indexing: the collision nuclide's ACE grid index may have been
-  // deferred on the flight-path lookup (fast-multipole nuclides). Compute it
-  // now so the collision kernel / secondary sampling / tallies have it.
+  // The energy-grid index is deferred on fast multipole lookups; compute it
+  // now for the collision nuclide so secondary sampling and tallies have it
   data::nuclides[i_nuclide]->ensure_grid_index(p);
 
   // Create fission bank sites. Note that while a fission reaction is sampled,
@@ -714,9 +712,7 @@ void scatter(Particle& p, int i_nuclide)
     // NON-S(A,B) ELASTIC SCATTERING
 
     // Determine temperature
-    double kT = (nuc->multipole_)
-                  ? p.sqrtkT() * p.sqrtkT()
-                  : nuc->kTs_[i_temp];
+    double kT = nuc->multipole_ ? p.sqrtkT() * p.sqrtkT() : nuc->kTs_[i_temp];
 
     // Perform collision physics for elastic scattering
     elastic_scatter(i_nuclide, *nuc->reactions_[0], kT, p);
@@ -740,18 +736,13 @@ void scatter(Particle& p, int i_nuclide)
     // =======================================================================
     // INELASTIC SCATTERING
 
-    // Fast-segment multipole: select the inelastic level from POLE channel
-    // cross sections rather than the tabulated ACE reaction xs. The flight
-    // path already uses the collapsed pole sum; here channels are evaluated
-    // SEQUENTIALLY, on demand, as the selection walk reaches them (shared
-    // pole reciprocals computed once by fast_chan_begin) -- pre-evaluating
-    // all channels read the whole ~13 KB residue block when the walk
-    // typically stops after a few. A channel not present in the fast fit
-    // falls back to the ACE table.
-    bool fast = nuc->multipole_ &&
-                nuc->multipole_->fast_present_ &&
-                p.E() > nuc->multipole_->E_max_ &&
-                p.E() <= nuc->multipole_->fast_E_max_;
+    // In the fast multipole segment, select the inelastic level from the
+    // pole channel cross sections so that the selection is consistent with
+    // the total used in transport. Channels are evaluated on demand as the
+    // walk reaches them; a channel not present in the fit falls back to the
+    // tabulated data.
+    bool fast = nuc->mp_fast_present_ && p.E() > nuc->mp_E_max_ &&
+                p.E() <= nuc->mp_fast_E_max_;
     WindowedMultipole::FastChanCtx chan_ctx;
     if (fast)
       nuc->multipole_->fast_chan_begin(p.E(), chan_ctx);

@@ -21,6 +21,7 @@
 #include "openmc/tallies/filter_delayedgroup.h"
 #include "openmc/tallies/filter_energy.h"
 
+#include <atomic>
 #include <numeric>
 #include <string>
 
@@ -259,6 +260,10 @@ double get_nuclide_neutron_heating(
   auto i_temp = micro.index_temp;
   if (i_temp < 0)
     return 0.0; // Can be true due to multipole
+
+  // The energy-grid index is deferred on fast multipole lookups
+  if (micro.index_grid == C_NONE)
+    nuc.ensure_grid_index(const_cast<Particle&>(p));
 
   // Determine total kerma
   const auto& rx {*nuc.reactions_[mt]};
@@ -537,107 +542,82 @@ double get_nuclide_xs(const Particle& p, int i_nuclide, int score_bin)
     return micro.absorption - micro.fission;
   }
 
-  auto i_temp = micro.index_temp;
-  // WHICH PATH SERVES THIS SCORE.
-  //
-  // index_temp < 0 marks the RESOLVED multipole branch. The FAST branch does
-  // NOT set that -- it leaves a valid index_temp while deferring the grid
-  // search (lazy_grid), so index_grid stays C_NONE. A score falling through
-  // to the tabulated path below would then interpolate rx.xs(micro) on an
-  // invalid index: measured 2026-09-09 as every (n,2n)/(n,3n) reading exactly
-  // zero, threshold (n,p)/(n,alpha) zero, and U-238 (n,gamma) 5.8% low
-  // because its fast-range share was lost.
-  //
-  // Both conditions therefore mean "the poles, not the tables", which is also
-  // what keeps tallies on the same data transport used.
-  const bool from_poles = (i_temp < 0) || (micro.index_grid == C_NONE);
-  if (!from_poles) {
-    // Get index on energy grid and interpolation factor
-    auto i_grid = micro.index_grid;
-    auto f = micro.interp_factor;
-
-    // Calculate interpolated cross section
-    double xs = rx.xs(micro);
-
-    if (settings::run_mode == RunMode::EIGENVALUE &&
-        score_bin == HEATING_LOCAL) {
-      // Determine kerma for fission as (EFR + EGP + EGD + EB)*sigma_f
-      double kerma_fission =
-        nuc.fragments_
-          ? ((*nuc.fragments_)(p.E_last()) + (*nuc.betas_)(p.E_last()) +
-              (*nuc.prompt_photons_)(p.E_last()) +
-              (*nuc.delayed_photons_)(p.E_last())) *
-              micro.fission
-          : 0.0;
-
-      // Determine non-fission kerma as difference
-      double kerma_non_fission = xs - kerma_fission;
-
-      // Re-weight non-fission kerma by keff to properly balance energy release
-      // and deposition. See D. P. Griesheimer, S. J. Douglass, and M. H.
-      // Stedry, "Self-consistent energy normalization for quasistatic reactor
-      // calculations", Proc. PHYSOR, Cambridge, UK, Mar 29-Apr 2, 2020.
-      xs = simulation::keff * kerma_non_fission + kerma_fission;
+  // The resolved multipole range has no energy-grid index (index_temp < 0).
+  // The fast multipole segment keeps a temperature index but defers the grid
+  // search (index_grid == C_NONE). In both cases the depletion reactions are
+  // served from the pole representation, consistent with the cross sections
+  // used in transport.
+  const bool resolved_mp = micro.index_temp < 0;
+  const bool fast_mp = !resolved_mp && micro.index_grid == C_NONE;
+  int j_dep = -1;
+  for (int j = 0; j < DEPLETION_RX.size(); ++j) {
+    if (rx.mt_ == DEPLETION_RX[j]) {
+      j_dep = j;
+      break;
     }
-    return xs;
-  } else {
-    // MULTIPOLE: no energy-grid index here, so the tabulated reaction data
-    // cannot be interpolated. The six DEPLETION_RX reactions ARE available
-    // from the pole representation -- Nuclide::calculate_xs now fills
-    // micro.reaction across both the resolved and fast segments -- so serve
-    // them from there instead of returning zero.
-    for (int j = 0; j < DEPLETION_RX.size(); ++j) {
-      if (rx.mt_ != DEPLETION_RX[j])
-        continue;
-      // micro.reaction is ONLY populated when need_depletion_rx is set --
-      // Nuclide::calculate_xs skips that work otherwise. Reading it
-      // unconditionally returned an unfilled array, which reported U-238
-      // (n,gamma) 96% low and B-10 (n,alpha) as zero in a plain tally run
-      // (measured 2026-09-09).
-      //
-      // Fill it ONCE per lookup instead. One sweep produces all six channels
-      // -- they share the Faddeeva values in the resolved range, and the fast
-      // range evaluates none -- so evaluating per score repeated the window
-      // search and every pole's w(z) to keep one channel of six, at ~15x the
-      // cost (Ben, 2026-09-09: "all MTs should be sharing the W(z) ... why the
-      // slowdown?").
-      if (simulation::need_depletion_rx || micro.reaction_valid)
-        return micro.reaction[j];
-      if (nuc.multipole_) {
-        auto& m = const_cast<NuclideMicroXS&>(micro);
-        for (double& r : m.reaction)
-          r = 0.0;
-        const double E = p.E();
-        const auto& mp = *nuc.multipole_;
-        if (mp.fast_present_ && E > mp.E_max_ && E <= mp.fast_E_max_) {
-          mp.evaluate_fast(E, m.reaction);
-        } else {
-          mp.evaluate(E, p.sqrtkT(), m.reaction);
-        }
-        m.reaction_valid = true;
-        return micro.reaction[j];
+  }
+
+  if ((resolved_mp || fast_mp) && j_dep >= 0 && nuc.multipole_) {
+    // reaction[] is filled by Nuclide::calculate_xs only when depletion rates
+    // are needed; otherwise fill it once per lookup here
+    if (!(simulation::need_depletion_rx || micro.reaction_valid)) {
+      auto& m = const_cast<NuclideMicroXS&>(micro);
+      for (double& r : m.reaction)
+        r = 0.0;
+      const double E = p.E();
+      const auto& mp = *nuc.multipole_;
+      if (mp.fast_present_ && E > mp.E_max_ && E <= mp.fast_E_max_) {
+        mp.evaluate_fast(E, m.reaction);
+      } else {
+        mp.evaluate(E, p.sqrtkT(), m.reaction);
       }
-      return 0.0;
+      m.reaction_valid = true;
     }
-    // Any OTHER MT -- MT105 (n,t), an inelastic level, ... -- is not carried
-    // per-channel in micro and would silently score zero. That silence is
-    // exactly what hid the depletion defect: a zero score is
-    // indistinguishable from a genuinely zero reaction rate. Say it once,
-    // loudly, rather than returning a number nobody can audit.
-    static bool warned_mt_multipole = false;
-    if (!warned_mt_multipole) {
-      warned_mt_multipole = true;
-      warning("Tally scores MT" + std::to_string(rx.mt_) +
-              " for a nuclide evaluated with windowed multipole data, where "
-              "only the six depletion reactions are available per-MT. This "
-              "score will be ZERO and the tally is not trustworthy. Restrict "
-              "the tally to (n,gamma), (n,p), (n,alpha), (n,2n), (n,3n), "
-              "(n,4n), fission, absorption, elastic or total, or run this "
-              "nuclide from ACE data.");
+    return micro.reaction[j_dep];
+  }
+
+  if (resolved_mp) {
+    // Other reactions are not available per MT from multipole data. Warn
+    // once rather than score zero silently.
+    static std::atomic<bool> warned {false};
+    if (!warned.exchange(true)) {
+      warning(fmt::format(
+        "A tally scores MT={} for a nuclide evaluated with windowed multipole "
+        "data in the resolved resonance range, where only the depletion "
+        "reactions (n,gamma), (n,p), (n,alpha), (n,2n), (n,3n), and (n,4n) "
+        "are available per reaction. This score will be zero.",
+        rx.mt_));
     }
     return 0.0;
   }
-  return 0.0;
+
+  // Tabulated data; compute the deferred grid index if needed
+  if (fast_mp)
+    nuc.ensure_grid_index(const_cast<Particle&>(p));
+
+  // Calculate interpolated cross section
+  double xs = rx.xs(micro);
+
+  if (settings::run_mode == RunMode::EIGENVALUE && score_bin == HEATING_LOCAL) {
+    // Determine kerma for fission as (EFR + EGP + EGD + EB)*sigma_f
+    double kerma_fission =
+      nuc.fragments_
+        ? ((*nuc.fragments_)(p.E_last()) + (*nuc.betas_)(p.E_last()) +
+            (*nuc.prompt_photons_)(p.E_last()) +
+            (*nuc.delayed_photons_)(p.E_last())) *
+            micro.fission
+        : 0.0;
+
+    // Determine non-fission kerma as difference
+    double kerma_non_fission = xs - kerma_fission;
+
+    // Re-weight non-fission kerma by keff to properly balance energy release
+    // and deposition. See D. P. Griesheimer, S. J. Douglass, and M. H.
+    // Stedry, "Self-consistent energy normalization for quasistatic reactor
+    // calculations", Proc. PHYSOR, Cambridge, UK, Mar 29-Apr 2, 2020.
+    xs = simulation::keff * kerma_non_fission + kerma_fission;
+  }
+  return xs;
 }
 
 //! Update tally results for continuous-energy tallies with a tracklength or

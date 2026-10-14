@@ -1,11 +1,4 @@
-#include <x86intrin.h>
-
 #include "openmc/nuclide.h"
-
-#include <atomic>
-
-
-#include <cstdlib> // for getenv (WMP_FAST_ONLY gate)
 
 #include "openmc/capi.h"
 #include "openmc/container_util.h"
@@ -578,8 +571,8 @@ double Nuclide::nu(double E, EmissionMode mode, int group) const
 
 void Nuclide::init_nu_fast_map(double e_lo, double e_hi)
 {
-  // Only for tabulated total nu with delayed neutrons on (the case nu(E,
-  // total) actually reads total_nu_); polynomial nu is already cheap.
+  // Only tabulated total nu with delayed neutrons on is worth mapping (the
+  // case where nu(E, total) reads total_nu_); polynomial nu is already cheap
   nu_fast_ok_ = false;
   if (!total_nu_ || !settings::create_delayed_neutrons)
     return;
@@ -604,9 +597,9 @@ void Nuclide::init_nu_fast_map(double e_lo, double e_hi)
     nu_cell_[c] = j;
   }
   nu_fast_ok_ = true;
-  // SELF-VALIDATION: the map must reproduce the original evaluator exactly
-  // (this also catches non-lin-lin/multi-region tables, whose internals
-  // Tabulated1D does not expose). Any mismatch -> disable, fall back.
+  // The map must reproduce the Tabulated1D evaluation exactly; this also
+  // rejects tables that are not lin-lin over a single region. Fall back to
+  // nu() on any mismatch.
   for (int i = 0; i <= 2000; ++i) {
     double E = e_lo + (e_hi - e_lo) * i / 2000.0;
     double a = nu_total_fast(E);
@@ -626,20 +619,11 @@ void Nuclide::calculate_elastic_xs(Particle& p) const
   // Get temperature index, grid index, and interpolation factor
   auto& micro {p.neutron_xs(index_)};
 
-  // LAZY ELASTIC in the fast segment: calculate_xs() left the sentinel
-  // because the flight never needed elastic, so split it out of the POLES
-  // now. Reading the ACE table here instead would be cheaper (the grid
-  // index is already available) but wrong in kind: total would come from
-  // poles and elastic from ACE, and OpenMC infers inelastic as
-  // total - elastic - absorption, so our ~1-2% fast-range fit error would
-  // surface as spurious or suppressed inelastic scattering. This also keeps
-  // the deferred grid index (see lazy_grid in calculate_xs) deferred.
-  // WMP_NO_FAST must gate this too: with the fast range forced onto ACE the
-  // flight's total/absorption are tabulated, so taking elastic from the poles
-  // would mix sources within a single lookup.
-  static const bool no_fast_el = std::getenv("WMP_NO_FAST") != nullptr;
-  if (!no_fast_el && mp_fast_present_ && p.E() > mp_E_max_ &&
-      p.E() <= mp_fast_E_max_) {
+  // In the fast multipole segment, elastic is not computed on the flight path
+  // (see calculate_xs) and is taken from the poles here. Taking it from the
+  // tabulated data instead would mix representations, since inelastic is
+  // inferred as total - elastic - absorption.
+  if (mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_) {
     micro.elastic = multipole_->evaluate_fast_elastic(p.E());
     return;
   }
@@ -683,13 +667,6 @@ void Nuclide::calculate_xs(
 {
   auto& micro {p.neutron_xs(index_)};
 
-  // PROFILING (wmp-fast-profile branch): classify + time this lookup.
-  // SYMMETRIC REGION TIMING: six ticks are taken on EVERY path at the same
-  // points, so ACE, fast-multipole and resolved-multipole lookups all carry
-  // identical instrumentation and their per-region costs are comparable.
-  // Regions that do not apply to a path simply measure ~0 (adjacent ticks).
-  uint64_t tH = 0, tA = 0, tB = 0, tC = 0, tD = 0, tE = 0, tF = 0, tT = 0;
-
   // Initialize cached cross sections to zero
   micro.elastic = CACHE_INVALID;
   micro.thermal = 0.0;
@@ -697,20 +674,12 @@ void Nuclide::calculate_xs(
 
   // Check to see if there is multipole data present at this energy
   bool use_mp = mp_present_ && p.E() >= mp_E_min_ && p.E() <= mp_E_max_;
-  // WMP_FAST_ONLY=1: force the RESOLVED range onto the tabulated (ACE) path
-  // so only the URR/fast segment uses poles -- isolates fast-range costs.
-  static const bool fast_only = std::getenv("WMP_FAST_ONLY") != nullptr;
-  if (fast_only)
-    use_mp = false;
 
   // Evaluate multipole or interpolate
   if (use_mp) {
-    // Call multipole kernel. When depletion rates are wanted AND this
-    // nuclide's disappearance lump holds more than MT102, the same call also
-    // fills micro.reaction from the per-MT residues and curvefit -- reusing
-    // the Faddeeva values and the window index it just computed, so no second
-    // w(z) and no second window search. Zeroed first because evaluate()
-    // accumulates into it.
+    // Call multipole kernel. When depletion rates are needed, the same call
+    // fills micro.reaction from the per-MT pole data, reusing the window
+    // search and Faddeeva evaluations.
     const bool want_dep = simulation::need_depletion_rx;
     if (want_dep) {
       for (double& r : micro.reaction)
@@ -726,11 +695,6 @@ void Nuclide::calculate_xs(
     micro.fission = sig_f;
     micro.nu_fission =
       fissionable_ ? sig_f * this->nu(p.E(), EmissionMode::total) : 0.0;
-
-    // micro.reaction was filled by evaluate() above, either from the per-MT
-    // residues and curvefit or -- for the 441 nuclides whose only
-    // disappearance channel is MT102 -- as the exact (absorption - fission)
-    // difference. Nothing further to do here.
 
     /*
      * index_temp, index_grid, and interp_factor are used only in the
@@ -799,36 +763,15 @@ void Nuclide::calculate_xs(
 
     micro.index_temp = i_temp;
 
-    // Fast-segment multipole? The transport cross sections come from the
-    // T=0 pole sums instead of the tabulated grids.
-    // WMP_NO_FAST=1: force the FAST range onto the tabulated (ACE) path so
-    // only lowE+resolved use poles. Exact complement of WMP_FAST_ONLY (which
-    // clears use_mp above), letting the two segments be attributed
-    // separately in k and in runtime. Like WMP_FAST_ONLY this CHANGES the
-    // cross sections, so the random walk diverges -- valid for attribution,
-    // not for reproducing a specific crash.
-    static const bool no_fast = std::getenv("WMP_NO_FAST") != nullptr;
-    bool use_fast_mp = !no_fast &&
+    // In the fast multipole segment the transport cross sections come from
+    // the pole representation, so the energy-grid search is deferred until a
+    // collision needs the tabulated data (see ensure_grid_index). Most flight
+    // lookups never collide in this nuclide.
+    bool use_fast_mp =
       mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
 
-    // LAZY GRID INDEXING: a fast-multipole lookup whose transport xs come
-    // entirely from poles needs the ACE grid index only at a collision
-    // (channel-fallback / secondary sampling / tallies). The URR band no
-    // longer forces an eager search -- calculate_urr_xs now takes the smooth
-    // inelastic from the pole other-scatter group (see there), so nothing on
-    // the flight path reads the grid. Defer the binary search: most flight
-    // lookups never collide in this nuclide, so it is pure saving;
-    // ensure_grid_index() recomputes it on demand.
-    // The depletion exception is GONE: the fast segment now serves
-    // micro.reaction from its own poles (evaluate_fast's dep argument), so a
-    // depletion run no longer needs the tabulated reaction data and no longer
-    // has to force the grid search on every fast lookup. That restores the
-    // saving described above for exactly the runs that were paying most for
-    // losing it.
-    bool lazy_grid = use_fast_mp;
-
     int i_grid = 0;
-    if (lazy_grid) {
+    if (use_fast_mp) {
       micro.index_grid = C_NONE; // sentinel: deferred
       micro.interp_factor = 0.0;
     } else {
@@ -878,11 +821,8 @@ void Nuclide::calculate_xs(
       }
     }
 
-    // Calculate microscopic nuclide photon production cross section.
-    // Under lazy grid indexing there is no grid index yet (i_grid=0 and f
-    // UNINITIALIZED -- interpolating here was UB producing garbage
-    // photon_prod on every fast-multipole flight lookup). Zero it instead;
-    // ensure_grid_index() fills the real value at collision time.
+    // Calculate microscopic nuclide photon production cross section. With a
+    // deferred grid index it is filled by ensure_grid_index() instead.
     if (micro.index_grid == C_NONE) {
       micro.photon_prod = 0.0;
     } else {
@@ -890,14 +830,8 @@ void Nuclide::calculate_xs(
                           f * xs(i_grid + 1, XS_PHOTON_PROD);
     }
 
-    // Depletion-related reactions.
-    //
-    // Skipped entirely under fast multipole: evaluate_fast filled
-    // micro.reaction from the pole representation below, and reading the ACE
-    // tables here would both overwrite it and mix sources -- transport from
-    // poles, depletion from tabulated data. This is also what allows
-    // lazy_grid above to stay on during a depletion run, since i_grid/f are
-    // then never needed.
+    // Depletion-related reactions (served from the poles in the fast
+    // multipole segment, see below)
     if (simulation::need_depletion_rx && !use_fast_mp) {
       // Initialize all reaction cross sections to zero
       for (double& xs_i : micro.reaction) {
@@ -935,18 +869,12 @@ void Nuclide::calculate_xs(
       }
     }
 
-    // Fast-segment multipole: transport cross sections from the T=0 pole
-    // sums (the tabulated interpolations above were skipped). Channel
-    // sampling, partial fissions, and secondary distributions keep using
-    // the tabulated data through the grid indices (by design: poles carry
-    // the transport xs, ACE carries branching + secondaries). With LSSF=1
-    // URR ptables on, calculate_urr_xs multiplies the band factors onto
-    // these pole values (see the pole_base gate there).
+    // Fast multipole segment: transport cross sections and depletion
+    // reactions from the pole representation. Secondary distributions and
+    // partial fissions keep using the tabulated data through the grid index.
+    // With probability tables on, calculate_urr_xs applies the band factors
+    // to these values.
     if (use_fast_mp) {
-      // Depletion channels come from the SAME call, off the same window and
-      // the same pole reciprocals, instead of from the ACE reaction tables
-      // (whose block above is skipped for exactly this reason). Zeroed first
-      // because evaluate_fast accumulates.
       if (simulation::need_depletion_rx) {
         for (double& r : micro.reaction)
           r = 0.0;
@@ -955,15 +883,8 @@ void Nuclide::calculate_xs(
       std::tie(sig_t, sig_a, sig_f) = multipole_->evaluate_fast(
         p.E(), simulation::need_depletion_rx ? micro.reaction : nullptr);
       micro.total = sig_t;
-      // LAZY ELASTIC. The flight needs total/absorption/fission only --
-      // elastic is not needed until a collision samples a channel -- so the
-      // fast segment sums elastic into its scatter group and leaves the
-      // sentinel here. calculate_elastic_xs() splits it back out from the
-      // POLES on demand (not from ACE: mixing sources would turn our fast
-      // fit error into spurious inelastic events, since OpenMC derives
-      // inelastic as total - elastic - absorption). Anything reading
-      // micro.elastic before a collision must resolve it first --
-      // calculate_urr_xs does, and it is the only such site.
+      // Elastic is only needed when a collision samples a channel, so it is
+      // left to calculate_elastic_xs()
       micro.elastic = CACHE_INVALID;
       micro.absorption = sig_a;
       micro.fission = sig_f;
@@ -999,25 +920,17 @@ void Nuclide::calculate_xs(
 
   micro.last_E = p.E();
   micro.last_sqrtkT = p.sqrtkT();
-  // reaction[] is populated above only when need_depletion_rx is set. Marking
-  // that here lets an MT tally under multipole fill it lazily ONCE per lookup
-  // (see get_nuclide_xs) instead of re-evaluating the poles for every score.
-  // This assignment must stay with last_E: both describe the same cache.
+  // reaction[] is only populated when depletion rates are needed; tallies may
+  // fill it lazily otherwise (see get_nuclide_xs)
   micro.reaction_valid = simulation::need_depletion_rx;
-  {
-  }
 }
 
 void Nuclide::ensure_grid_index(Particle& p) const
 {
-  // Compute the ACE energy-grid index if it was deferred (lazy grid
-  // indexing, see calculate_xs). Called at collision time for the sampled
-  // nuclide so all downstream consumers (channel fallback, secondary
-  // sampling, tallies) see a valid index. No-op if already computed.
   auto& micro {p.neutron_xs(index_)};
-  // Already computed, or the resolved-multipole case (index_temp == C_NONE)
-  // which sets index_grid = C_NONE deliberately and needs no grid (resolved-
-  // range collisions are elastic-only, below any inelastic threshold).
+
+  // Nothing to do if the index was computed, or in the resolved multipole
+  // range where no grid index is needed (index_temp == C_NONE)
   if (micro.index_grid != C_NONE || micro.index_temp == C_NONE)
     return;
 
@@ -1037,19 +950,16 @@ void Nuclide::ensure_grid_index(Particle& p) const
   } else {
     int i_low = grid.grid_index[i_log_union];
     int i_high = grid.grid_index[i_log_union + 1] + 1;
-    i_grid = i_low +
-             lower_bound_index(&grid.energy[i_low], &grid.energy[i_high], p.E());
+    i_grid = i_low + lower_bound_index(
+                       &grid.energy[i_low], &grid.energy[i_high], p.E());
   }
   if (grid.energy[i_grid] == grid.energy[i_grid + 1])
     ++i_grid;
   micro.index_grid = i_grid;
   micro.interp_factor = (p.E() - grid.energy[i_grid]) /
                         (grid.energy[i_grid + 1] - grid.energy[i_grid]);
-  // Fill photon_prod (deferred on the lazy flight path, see calculate_xs).
-  // Its ONLY consumer is sample_secondary_photons, which runs solely under
-  // photon transport -- in neutron-only mode the value is never read, so
-  // skip the interpolation entirely (Ben 2026-07-14; revisit when moving
-  // beyond neutron-only).
+  // Photon production was deferred as well; it is only read when photons are
+  // transported
   if (settings::photon_transport) {
     const auto& xs {xs_[i_temp]};
     double f = micro.interp_factor;
@@ -1170,38 +1080,21 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
     }
   }
 
-  // Determine the treatment of inelastic scattering. When the fast-segment
-  // multipole covers this energy, the pole "other-scatter" group -- total
-  // minus elastic minus absorption, all three still holding the pole values
-  // set by evaluate_fast (the ptable overwrites happen below) -- already IS
-  // the smooth inelastic contribution (in the URR band (n,xn)/MT5 are below
-  // threshold, so other-scatter = MT51..91 = MT4). Taking it from the poles
-  // removes the last ACE energy-grid dependency on the URR flight path, so
-  // the grid index can be deferred to collision (see lazy grid in
-  // calculate_xs). Verified vs NJOY MT4: median 1-3% (fit error on a channel
-  // that is a small fraction of the total). Otherwise read tabulated MT4.
-  // Both shortcuts are gated on multipole data being LOADED rather than USED,
-  // so they fire even when the segment flags have forced every cross section
-  // onto ACE.
+  // Determine the treatment of inelastic scattering. In the fast multipole
+  // segment, the smooth inelastic cross section is the pole value of
+  // total - elastic - absorption (all still unmodified by the tables here);
+  // otherwise it is read from the tabulated data.
   double inelastic = 0.;
-  bool pole_inel =
+  bool pole_base =
     mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
-  if (pole_inel) {
-    // total - elastic - absorption IS the pole other-scatter group, but the
-    // lazy split folded elastic INTO scatter, so the difference is only
-    // meaningful once elastic has been resolved. This is the one place the
-    // flight path must pay for the split, and it is confined to the URR band
-    // of URR nuclides (U-238: 20-149 keV, where MT51 opens at 45 keV).
+  if (pole_base) {
     if (micro.elastic == CACHE_INVALID)
       calculate_elastic_xs(p);
     inelastic = micro.total - micro.elastic - micro.absorption;
     if (inelastic < 0.)
       inelastic = 0.;
   } else if (urr.inelastic_flag_ != C_NONE && urr_inelastic_ != C_NONE) {
-    // The fast-multipole flight path DEFERS the ACE grid index (lazy_grid in
-    // calculate_xs), leaving index_grid = C_NONE. Reading the tabulated MT4
-    // with that sentinel would index the reaction array at a negative offset,
-    // so force the search here.
+    // The grid index may have been deferred (see calculate_xs)
     ensure_grid_index(p);
 
     // get interpolation factor
@@ -1216,16 +1109,10 @@ void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
     }
   }
 
-  // Multiply by smooth cross-section if needed (LSSF=1: the band values
-  // are factors on the smooth base). When the fast-segment multipole
-  // covers this energy, micro.elastic/absorption/fission already hold the
-  // pole-evaluated base — exactly the File 3 data the ptables are factors
-  // of — so do not clobber micro.elastic with the tabulated value.
+  // Multiply by smooth cross-section if needed. In the fast multipole
+  // segment, micro.elastic/absorption/fission already hold the pole values
+  // the band factors apply to.
   if (urr.multiply_smooth_) {
-    bool pole_base =
-      mp_fast_present_ && p.E() > mp_E_max_ && p.E() <= mp_fast_E_max_;
-    // CACHE_INVALID is -1.0, so an unresolved elastic here would SIGN-FLIP
-    // the band factor rather than fail loudly. Resolve it either way.
     if (!pole_base || micro.elastic == CACHE_INVALID) {
       calculate_elastic_xs(p);
     }
@@ -1490,7 +1377,7 @@ void nuclides_clear()
 
 bool multipole_in_range(const Nuclide& nuc, double E)
 {
-  return E >= nuc.multipole_->E_min_ && E <= nuc.multipole_->E_max_;
+  return nuc.mp_present_ && E >= nuc.mp_E_min_ && E <= nuc.mp_E_max_;
 }
 
 } // namespace openmc

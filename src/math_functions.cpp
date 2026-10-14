@@ -892,64 +892,39 @@ double spline_integrate(int n, const double x[], const double y[],
   return s;
 }
 
-std::complex<double> zpf6h(std::complex<double> z)
+//! Sixth-order shifted rational approximation of the Faddeeva function for
+//! Im(z) > 0, w(z) ~ N(z + 1.5i) / D(z + 1.5i) with D even in its argument.
+//! The construction follows B. Forget, J. Yu, and G. Ridley, "Direct Doppler
+//! broadening of windowed multipole cross sections with a rational
+//! approximation of the Faddeeva function," Proc. PHYSOR 2022. Maximum
+//! relative error 1.6e-5 over |Re z| <= 600, 1e-4 <= Im z <= 1200, the
+//! domain spanned by the windowed multipole libraries.
+static std::complex<double> faddeeva_rational(std::complex<double> z)
 {
-  // 6th-order shifted rational approximation of the Faddeeva function.
-  // Scalar twin of w_rational6() in wmp.cpp -- see the long note there for
-  // the construction, the fitted domain and the accuracy figures. Kept in
-  // step with it so the scalar callers of faddeeva() (temperature
-  // derivatives, the legacy non-global-format evaluate()) and the hot pole
-  // sweep agree to the last bit.
-  //
-  // Max relative error 1.6e-5 over |Re z| <= 600, 1e-4 <= Im z <= 1200,
-  // essentially flat; three fewer complex multiplies than zpf8h below.
   using C = std::complex<double>;
   z += C(0.0, 1.5);
   const auto zz = z * z;
-  constexpr std::array<C, 6> aa6 = {C(-8.2804011586059, 0.0),
+  constexpr std::array<C, 6> aa = {C(-8.2804011586059, 0.0),
     C(0.0, 8.876835541419577), C(5.57957343594273, 0.0),
     C(0.0, -4.262789761626753), C(-0.8463988774687549, 0.0),
     C(0.0, 0.5641895835477563)};
-  constexpr std::array<double, 4> bb6 = {
+  constexpr std::array<double, 4> bb = {
     -0.901452218111202, 6.844707994387722, -5.810043673216703, 1.0};
-  return (((((aa6[5] * z + aa6[4]) * z + aa6[3]) * z + aa6[2]) * z + aa6[1]) *
-             z +
-           aa6[0]) /
-         ((((bb6[3] * zz + bb6[2]) * zz + bb6[1]) * zz + bb6[0]));
+  return (((((aa[5] * z + aa[4]) * z + aa[3]) * z + aa[2]) * z + aa[1]) * z +
+           aa[0]) /
+         ((((bb[3] * zz + bb[2]) * zz + bb[1]) * zz + bb[0]));
 }
 
-std::complex<double> zpf8h(std::complex<double> z)
+//! Faddeeva function to machine precision, for Im(z) > 0
+static std::complex<double> faddeeva_exact(std::complex<double> z)
 {
-  // 8th-order shifted rational approximation of the Faddeeva function
-  // (Forget et al., PHYSOR; implementation after J. Yu,
-  // github.com/jiankai-yu/openmc-wmp-zp8h). Branch-free: one Horner
-  // chain + a z^2 denominator.
-  //
-  // SUPERSEDED as the default by zpf6h above, and no longer called; kept as
-  // the reference kernel for accuracy studies. It is the more accurate of the
-  // two for |z| > 4 (~1e-7) but falls to ~1e-3 at |z| < 1, i.e. on resonance.
-  using C = std::complex<double>;
-  z += C(0.0, 0.9);
-  const auto zz = z * z;
-  constexpr std::array<C, 8> aa8 = {C(+11.7559071436993, 0.0),
-    C(0.0, -32.310199761603), C(-21.9357456686406, 0.0),
-    C(0.0, 31.490536152863), C(6.75847413957232, 0.0),
-    C(0.0, -8.07354660639634), C(-0.507771291744591, 0.0),
-    C(0.0, 0.564189504758109)};
-  constexpr std::array<double, 5> bb8 = {6.5625, -52.5, 52.5, -14.0, 1.0};
-  return (((((((aa8[7] * z + aa8[6]) * z + aa8[5]) * z + aa8[4]) * z +
-              aa8[3]) *
-               z +
-             aa8[2]) *
-              z +
-            aa8[1]) *
-             z +
-           aa8[0]) /
-         ((((bb8[4] * zz + bb8[3]) * zz + bb8[2]) * zz + bb8[1]) * zz +
-           bb8[0]);
+  // Note that Faddeeva::w will interpret zero as machine epsilon
+  return Faddeeva::w(z);
 }
 
-std::complex<double> faddeeva(std::complex<double> z)
+//! Apply the reflection for Im(z) < 0 to a kernel defined for Im(z) > 0
+template<typename F>
+static std::complex<double> faddeeva_with(F&& w, std::complex<double> z)
 {
   // Technically, the value we want is given by the equation:
   // w(z) = I/pi * Integrate[Exp[-t^2]/(z-t), {t, -Infinity, Infinity}]
@@ -963,25 +938,24 @@ std::complex<double> faddeeva(std::complex<double> z)
   // If we call the integral form w_int, and the function form w_fun:
   // For imag(z) > 0, w_int(z) = w_fun(z)
   // For imag(z) < 0, w_int(z) = -conjg(w_fun(conjg(z)))
+  return z.imag() > 0.0 ? w(z) : -std::conj(w(std::conj(z)));
+}
 
-  // Note that Faddeeva::w will interpret zero as machine epsilon
-  // Kernel selection: zpf6h (branch-free 6th-order rational) for WMP speed;
-  // zpf8h is the previous default and stays available, and Faddeeva::w is the
-  // full-precision fallback. Keep this in step with WMP_W_ORDER in wmp.cpp.
-#define OPENMC_W_IMPL zpf6h
-  return z.imag() > 0.0 ? OPENMC_W_IMPL(z)
-                        : -std::conj(OPENMC_W_IMPL(std::conj(z)));
-#undef OPENMC_W_IMPL
+std::complex<double> faddeeva(std::complex<double> z)
+{
+  return faddeeva_with(faddeeva_rational, z);
 }
 
 std::complex<double> w_derivative(std::complex<double> z, int order)
 {
+  // The derivatives are built by recurrence from w(z), which cancels
+  // significant digits at large |z|, so the exact kernel is used here
   using namespace std::complex_literals;
   switch (order) {
   case 0:
-    return faddeeva(z);
+    return faddeeva_with(faddeeva_exact, z);
   case 1:
-    return -2.0 * z * faddeeva(z) + 2.0i / SQRT_PI;
+    return -2.0 * z * faddeeva_with(faddeeva_exact, z) + 2.0i / SQRT_PI;
   default:
     return -2.0 * z * w_derivative(z, order - 1) -
            2.0 * (order - 1) * w_derivative(z, order - 2);

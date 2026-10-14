@@ -1,6 +1,5 @@
 #include "openmc/simulation.h"
 
-
 #include "openmc/bank.h"
 #include "openmc/capi.h"
 #include "openmc/collision_track.h"
@@ -219,8 +218,6 @@ int openmc_simulation_finalize()
   // Stop timers and show timing statistics
   simulation::time_finalize.stop();
   simulation::time_total.stop();
-
-  // WMP fast-range profiling report (diagnostic branch wmp-fast-profile)
 
 #ifdef OPENMC_MPI
   // Reduce track count across ranks for correct reporting. In shared secondary

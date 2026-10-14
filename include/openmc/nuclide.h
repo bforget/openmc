@@ -109,46 +109,37 @@ public:
   // Multipole data
   unique_ptr<WindowedMultipole> multipole_;
 
-  //! Multipole energy bounds, MIRRORED here out of the WindowedMultipole
-  //! object. calculate_xs tests these on EVERY flight lookup, and reading them
-  //! through multipole_ costs a pointer chase into a separate allocation
-  //! before any evaluation happens -- measured at +34 cyc on the fast path and
-  //! +70 on the resolved path against ACE, which short-circuits on a null
-  //! pointer. Holding them in the Nuclide keeps the test in already-hot data.
-  bool mp_present_ {false};      //!< multipole_ != nullptr
-  bool mp_fast_present_ {false}; //!< multipole_->fast_present_
-  double mp_E_min_ {0.0};
-  double mp_E_max_ {0.0};
-  double mp_fast_E_max_ {0.0};
+  //! Multipole energy bounds, mirrored from the WindowedMultipole object so
+  //! the range tests on every cross section lookup need no dereference
+  bool mp_present_ {false};      //!< Is multipole data present?
+  bool mp_fast_present_ {false}; //!< Does it include a fast segment?
+  double mp_E_min_ {0.0};        //!< Lower bound of multipole data [eV]
+  double mp_E_max_ {0.0};        //!< Upper bound of the resolved range [eV]
+  double mp_fast_E_max_ {0.0};   //!< Upper bound of the fast segment [eV]
 
-  // O(1) total-nu lookup for the fast-multipole flight path. ACE carries
-  // nu*sigma_f pre-multiplied on the grid, but the pole path must evaluate
-  // nu(E) itself -- a per-lookup Tabulated1D binary search (~100+ cycles).
-  // This uniform-E bracket map over the tabulated (lin-lin) nu makes it
-  // O(1) and EXACT (self-validated against the original evaluator at init;
-  // disabled on any mismatch, falling back to nu()).
-  //! Build the map over [e_lo, e_hi] (the fast segment's query range).
+  //! Build an O(1) lookup of the tabulated total nu over [e_lo, e_hi]. The
+  //! fast multipole segment evaluates nu(E) on every lookup, where a binary
+  //! search would dominate. Only enabled when the map reproduces the
+  //! Tabulated1D evaluation exactly.
   void init_nu_fast_map(double e_lo, double e_hi);
-  //! Exact O(1) tabulated total-nu; only call when nu_fast_ok_.
+
+  //! Tabulated total nu via the O(1) map; only valid when nu_fast_ok_
   double nu_total_fast(double E) const
   {
-    int c = (int)((E - nu_e0_) * nu_inv_de_);
-    if (c < 0)
-      c = 0;
-    int cmax = (int)nu_cell_.size() - 1;
-    if (c > cmax)
-      c = cmax;
+    int c = static_cast<int>((E - nu_e0_) * nu_inv_de_);
+    c = std::min(std::max(c, 0), static_cast<int>(nu_cell_.size()) - 1);
     int j = nu_cell_[c];
-    int jmax = (int)nu_fx_.size() - 2;
+    int jmax = static_cast<int>(nu_fx_.size()) - 2;
     while (j < jmax && E >= nu_fx_[j + 1])
       ++j;
     double f = (E - nu_fx_[j]) / (nu_fx_[j + 1] - nu_fx_[j]);
     return nu_fy_[j] + f * (nu_fy_[j + 1] - nu_fy_[j]);
   }
-  bool nu_fast_ok_ {false};
-  vector<double> nu_fx_, nu_fy_; //!< tabulated nu (x ascending, lin-lin)
-  vector<int> nu_cell_;          //!< uniform-E cell -> bracketing index
-  double nu_e0_ {0.0}, nu_inv_de_ {0.0};
+  bool nu_fast_ok_ {false};      //!< Is the nu map usable?
+  vector<double> nu_fx_, nu_fy_; //!< Tabulated nu (ascending x, lin-lin)
+  vector<int> nu_cell_;          //!< Uniform-energy cell -> bracketing index
+  double nu_e0_ {0.0};           //!< Lower bound of the map [eV]
+  double nu_inv_de_ {0.0};       //!< 1 / cell width [1/eV]
 
   // Fission data
   bool fissionable_ {false};         //!< Whether nuclide is fissionable
