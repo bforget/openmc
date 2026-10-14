@@ -284,8 +284,9 @@ Two library formats are supported (see :ref:`io_data_wmp`). Version 2
 libraries extend the multipole representation over the whole energy range,
 with a low-energy segment below the resolved resonances and a fast segment
 covering the unresolved and fast range, and carry residues per reaction so
-that depletion reaction rates can be computed from the poles. Version 1
-libraries, such as those from the `WMP_Library
+that depletion reaction rates can be computed from the poles. A version 2
+library for ENDF/B-VIII.1 covering 557 nuclides can be downloaded `here
+<https://www.dropbox.com/scl/fo/0lv8bcvdz7w6fkyelqhan/APU3skc3yxUDF72Lh7aGi8c?rlkey=0qx7catx5t5cggsd344omxggj&dl=0>`_. Version 1 libraries, such as those from the `WMP_Library
 <https://github.com/mit-crpg/WMP_Library>`_ repository, continue to work and
 cover only the resolved resonance range. Both can be inspected with
 :meth:`openmc.data.WindowedMultipole.from_hdf5`, which returns a

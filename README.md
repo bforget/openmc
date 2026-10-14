@@ -24,6 +24,22 @@ Detailed [installation
 instructions](https://docs.openmc.org/en/stable/usersguide/install.html)
 can be found in the User's Guide.
 
+## Windowed Multipole Library, Version 2
+
+This branch (`wmp-v2`) extends OpenMC's windowed multipole representation over
+the whole neutron energy range: a low-energy segment below the resolved
+resonances, the resolved segment, and a fast segment covering the unresolved
+and fast range, with residues stored per reaction channel so depletion
+reaction rates come from the same representation as transport. The library
+file format is version 2.0; version 1 libraries remain supported. The format
+is documented in `docs/source/io_formats/data_wmp.rst`.
+
+A version 2 library for ENDF/B-VIII.1 (557 nuclides) is available at
+https://www.dropbox.com/scl/fo/0lv8bcvdz7w6fkyelqhan/APU3skc3yxUDF72Lh7aGi8c?rlkey=0qx7catx5t5cggsd344omxggj&dl=0. Unpack it and register the `.h5` files in your
+`cross_sections.xml` as `type="wmp"` entries, or use
+`openmc.data.DataLibrary` as described in the [User's
+Guide](https://docs.openmc.org/en/latest/usersguide/data.html).
+
 ## Citing
 
 If you use OpenMC in your research, please consider giving proper attribution by
